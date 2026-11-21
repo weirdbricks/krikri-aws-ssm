@@ -49,3 +49,36 @@ struct TestHttpResponse
                  @headers : HTTP::Headers = HTTP::Headers{"Content-Type" => "application/x-amz-json-1.1"})
   end
 end
+
+def receive_with_timeout(channel : Channel(T), timeout : Time::Span = 3.seconds) : T forall T
+  select
+  when value = channel.receive
+    value
+  when timeout(timeout)
+    raise "timed out waiting for a channel value"
+  end
+end
+
+def wait_until(timeout : Time::Span = 2.seconds, &) : Bool
+  deadline = Time.monotonic + timeout
+  while Time.monotonic < deadline
+    return true if yield
+    sleep 10.milliseconds
+  end
+  false
+end
+
+def read_with_timeout(session : KrikriAwsSsm::Session, timeout : Time::Span = 3.seconds) : KrikriAwsSsm::Output?
+  channel = Channel(KrikriAwsSsm::Output?).new(1)
+  spawn { channel.send(session.read?) }
+  select
+  when value = channel.receive
+    value
+  when timeout(timeout)
+    raise "timed out waiting for session output"
+  end
+end
+
+def read_required(session : KrikriAwsSsm::Session, timeout : Time::Span = 3.seconds) : KrikriAwsSsm::Output
+  read_with_timeout(session, timeout) || raise "session closed before output arrived"
+end
