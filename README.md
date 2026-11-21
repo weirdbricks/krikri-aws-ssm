@@ -6,8 +6,10 @@ data-channel protocol itself, so the controller needs **no AWS CLI** and **no
 `session-manager-plugin`** - only the SSM agent on the target and the usual AWS
 permissions.
 
-Status: **scaffold**. The protocol implementation lands incrementally; see
-`docs/protocol.md` for the wire format and the design notes it is built from.
+Status: phases 1-7 complete (wire protocol and session core, fake harness,
+control plane, KMS encryption, credential chain, live validation). The krikri
+transport integration is phase 8. See `docs/protocol.md` for the wire format
+and the design notes it is built from.
 
 ## What it does
 
@@ -72,7 +74,10 @@ crystal lib/ameba/bin/ameba.cr
 ```
 
 Live tests against a real SSM target are opt-in (`KRIKRI_SSM_LIVE=1`,
-`SSM_TARGET`, `SSM_REGION`) and never run in CI.
+`SSM_TARGET`, `SSM_REGION`, optional `SSM_ASSUME_ROLE_ARN`) and never run in
+CI. `terraform/` provisions the SSM-only AL2023 target, a KMS key whose
+preferences document mandates encryption, and a role to assume; destroy it
+after each validation round.
 
 Development deps mirror krikri: `ameba` 1.7.0 and the
 `weirdbricks/minitest.cr` fork (`v1.7.0-weirdbricks.2`).

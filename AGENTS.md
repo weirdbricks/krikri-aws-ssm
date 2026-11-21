@@ -18,6 +18,10 @@ terminal setup, base64 file transfer, become wrappers, error text, batching)
 belong in krikri, not here. Keep the boundary strict: krikri must be able to
 consume this shard without pulling Ansible semantics into it.
 
+The design and phasing for the krikri integration (issue #1664) is in
+[`docs/1664-plan.md`](docs/1664-plan.md); update it when a decision changes, and
+delete or archive it once the feature ships.
+
 ## Commands
 
 ```sh
@@ -35,6 +39,20 @@ needs `-Dpreview_mt` - that flag is deprecated and must not be reintroduced.
 
 CI (`.github/workflows/ci.yml`) runs format + ameba on
 `crystallang/crystal:1.22.2-alpine` and `crystal spec` on 1.22.2 and 1.13.0.
+
+## Working rules
+
+- **Always add specs.** No behaviour change lands without specs in the same
+  commit. Bug fixes come with a spec that fails before the fix; new protocol
+  paths are covered by a spec pinned to the reference implementation, not to
+  this shard's own output.
+- **Ameba and format must pass.** Before calling any change done, run
+  `crystal tool format src spec --check` and `crystal lib/ameba/bin/ameba.cr`;
+  both must be clean. Yellow lint is a broken build, not a warning to ignore.
+- **Lots of small, granular commits.** One logical change per commit: a spec
+  helper, a protocol constant, a parser branch, a doc update. Keep each commit
+  green (format + ameba + `crystal spec`) and never bundle unrelated work.
+  Reword or split before committing rather than after.
 
 ## Provenance (non-negotiable)
 

@@ -1,6 +1,23 @@
 # Changelog
 
-## 0.1.0 (in development)
+## 0.2.0 (in development)
+
+- Phase 5: KMS session encryption. `Kms` calls `GenerateDataKey` (64 bytes,
+  encryption context `aws:ssm:SessionId`/`aws:ssm:TargetId`), the handshake
+  action returns the plugin's exact `{"KMSCipherTextKey":...,"KMSCipherTextHash":null}`
+  result, `EncChallengeRequest` is decrypted and re-encrypted with the split
+  key, and payload types 1/11/12 use AES-256-GCM with a 12-byte nonce. A KMS
+  denial fails the handshake instead of downgrading to plaintext.
+- Phase 6: the standard AWS credential chain: environment statics, environment
+  web identity (IRSA), shared profiles (`credential_process`, `role_arn` +
+  `source_profile`/`credential_source`, `web_identity_token_file`, SSO), ECS
+  container credentials and IMDSv2, with expiry-aware refresh.
+- Phase 7: real-account validation harness (`terraform/`) and an opt-in live
+  suite covering command execution, KMS-encrypted sessions, a 1 MiB round trip
+  and `TerminateSession` cleanup, plus a real `AssumeRole` profile.
+- Still planned: the krikri transport integration (phase 8).
+
+## 0.1.0
 
 - Initial scaffold: shard metadata, CI, formatting/lint baseline, provenance
   NOTICE, and the wire-protocol notes in `docs/protocol.md`.
@@ -18,6 +35,3 @@
   open token message, agent handshake, input chunking, ordered inbound
   delivery with acks, retransmission with Jacobson/Karels RTO, liveness pings,
   idle timeout, and ResumeSession reconnect.
-- Still planned for 0.1.0: KMS session encryption and the full credential chain
-  (profiles, assume-role, SSO, IMDSv2, ECS/IRSA, credential_process). KMS
-  requests currently fail the handshake rather than downgrade to plaintext.

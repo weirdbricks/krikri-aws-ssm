@@ -3,3 +3,9 @@
 /.shards/
 *.dwarf
 /.crystal-build-cache/
+
+# Terraform live-validation harness (state is local only)
+/terraform/.terraform/
+/terraform/*.tfstate
+/terraform/*.tfstate.*
+/terraform/terraform.tfstate.backup
