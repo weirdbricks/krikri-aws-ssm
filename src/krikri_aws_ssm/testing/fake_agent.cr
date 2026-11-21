@@ -138,7 +138,7 @@ module KrikriAwsSsm::Testing
 
     private def handle_text(text : String) : Nil
       open_message = JSON.parse(text)
-      @open_messages.send(open_message)
+      observe(@open_messages, open_message)
       if @options.handshake? && !@handshake_sent
         @handshake_sent = true
         send_handshake_request
@@ -152,7 +152,7 @@ module KrikriAwsSsm::Testing
         handle_input_stream(message)
       when MessageType::ACKNOWLEDGE
         content = AcknowledgeContent.from_json(String.new(message.payload))
-        @acknowledged_sequences.send(content.sequence_number)
+        observe(@acknowledged_sequences, content.sequence_number)
       else
         # channel_closed / publication messages from the client are ignored.
       end

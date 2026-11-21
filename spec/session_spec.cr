@@ -380,6 +380,28 @@ describe KrikriAwsSsm::Session do
     end
   end
 
+  it "keeps processing client input after many agent outputs" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    begin
+      session = KrikriAwsSsm::Session.open(SessionSpecData.settings(gateway))
+      begin
+        agent = receive_with_timeout(gateway.agents)
+        outputs = 1_100
+        outputs.times { agent.send_output("x") }
+        outputs.times { read_required(session) }
+
+        session.write("after-acks")
+        assert_equal "after-acks",
+          String.new(receive_with_timeout(agent.received_input))
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
   it "skips SigV4 signing for a presigned StreamUrl" do
     gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS,
       presigned: true)
