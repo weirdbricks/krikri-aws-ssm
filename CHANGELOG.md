@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 (2026-11-21)
+
+- Keep SSM input flowing on a real agent: `pause_publication` and
+  `start_publication` are advisory (matching the reference plugin), output is
+  buffered so the websocket reader keeps processing acknowledgements while a
+  caller is not reading, the retransmission timeout caps at one second, and the
+  outgoing retransmit buffer drops its oldest entry at the reference plugin's
+  10,000-message capacity instead of growing without bound.
+
 ## 0.2.0 (2026-11-21)
 
 - Phase 5: KMS session encryption. `Kms` calls `GenerateDataKey` (64 bytes,
