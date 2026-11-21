@@ -34,7 +34,7 @@ The parallel execution context is the default on current Crystal, so nothing
 needs `-Dpreview_mt` - that flag is deprecated and must not be reintroduced.
 
 CI (`.github/workflows/ci.yml`) runs format + ameba on
-`crystallang/crystal:1.22.2-alpine` and `crystal spec` on 1.22.2 and 1.10.0.
+`crystallang/crystal:1.22.2-alpine` and `crystal spec` on 1.22.2 and 1.13.0.
 
 ## Provenance (non-negotiable)
 

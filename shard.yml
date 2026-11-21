@@ -13,7 +13,7 @@ description: |
 authors:
   - Krikri Contributors
 
-crystal: ">= 1.10.0"
+crystal: ">= 1.13.0"
 
 license: MIT
 

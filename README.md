@@ -34,7 +34,7 @@ transfer and error text live in krikri, not here.
 
 ## Requirements and permissions
 
-- Controller: Crystal `>= 1.10.0`, egress to `ssm.<region>.amazonaws.com` and
+- Controller: Crystal `>= 1.13.0`, egress to `ssm.<region>.amazonaws.com` and
   the data-channel host returned in `StreamUrl`.
 - Target: SSM agent, registered as a managed node.
 - Caller: `ssm:StartSession`, `ssm:ResumeSession`, `ssm:TerminateSession`, the
