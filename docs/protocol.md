@@ -58,7 +58,12 @@ swapped relative to RFC 4122. Getting this wrong makes every acknowledgement
 unmatchable and the session hang silently.
 
 `PayloadDigest` is verified on receive. Exempt: zero-length payloads, and
-`start_publication` / `pause_publication` (empty payload, zeroed digest).
+`start_publication` / `pause_publication` (`ClientMessage.Validate` returns
+early for those two message types). The serializer always writes a digest,
+including SHA-256 of an empty payload; only validation is exempt.
+
+`HeaderLength` is serialized as 116 by the reference plugin. This shard
+rejects any other value instead of trusting it as an offset.
 
 ## Message types
 
@@ -119,7 +124,31 @@ unmatchable and the session hang silently.
 {"HandshakeTimeToComplete":12345678,"CustomerMessage":""}
 ```
 
-`ActionStatus`: Success = 1, Failed = 2, Unsupported = 3.
+`ActionStatus`: Success = 1, Failed = 2, Unsupported = 3. The field is a
+JSON number, not a name. `ActionResult` and `Errors` are `null` on success
+(Go nil slice/interface), and `Error` is present as `""` on every processed
+action. `Authorization` is signed before the `Connection`, `Upgrade` and
+`Sec-WebSocket-*` headers are added, so `SignedHeaders` is exactly
+`host;x-amz-date` plus `x-amz-security-token` when a token exists.
+
+Divergence: for an unknown action the reference plugin's default branch sets
+`ActionResult` to `Unsupported` and leaves `ActionStatus` at 0 (a bug); this
+shard sets `ActionStatus = 3` and leaves `ActionResult` null, which is what the
+agent actually checks.
+
+Non-handshake output payloads: type 1 is stdout, type 11 is stderr, type 12 is
+the ASCII text `EXIT_CODE: <n>` (from the agent's `sendExitCode`), and
+`channel_closed.Output` is the session's closing text.
+
+## Resume
+
+`Reconnect` in the reference plugin calls `Close` then `Open` (which re-sends
+the open token message) and does **not** reinitialize the data channel:
+expected/outbound sequence numbers, buffers and encryption state survive, and
+the agent handshake is not replayed. `ResumeSession` supplies a fresh
+`StreamUrl`/`TokenValue` for the same session. This shard's
+`Session#resume` follows that sequence, and the fake gateway's resume spec
+asserts the open message carries the new token.
 
 ## KMS session encryption
 
@@ -137,20 +166,22 @@ unmatchable and the session hang silently.
    outbound (agent mirrors).
 6. Failure to negotiate must never downgrade to plaintext.
 
-## Resume
+## Pin list status
 
-`ResumeSession` returns a new `StreamUrl`/`TokenValue` for the same session.
-Whether the open message/handshake/KMS exchange has to be redone must be pinned
-from the plugin's `Reconnect` before implementing.
+Pinned by phase 1-4 specs:
 
-## Pin list (phase 1)
-
-- Header constants, `MessageType` padding and digest exemptions from
-  `clientmessage.go` / `messageparser.go`.
-- `MessageId` byte order (hand-written test vectors, both directions).
-- Ack `Flags` and sequence-0 convention.
+- Header constants, offsets, `MessageType` space padding and digest exemptions
+  (`clientmessage.go` / `messageparser.go`).
+- `MessageId` byte order, both directions, with hand-written bytes.
+- Ack `Flags = SYN | FIN`, sequence 0, and the payload JSON shape.
 - Timer defaults from `src/config/config.go`.
-- `Size` (payload 3): send vs ignore.
-- Full handshake JSON shapes, including the base64 `[]byte` fields.
-- KMS request/response and challenge transform.
-- `ResumeSession` state replay.
+- `Size` (payload 3): acknowledged and ignored (decision above).
+- Handshake request/response/complete JSON shapes, including `ActionResult:
+  null`, `Errors: null`, numeric `ActionStatus`, and nanosecond
+  `HandshakeTimeToComplete`.
+- `ResumeSession` state replay (decision above).
+
+Still to pin in phase 5:
+
+- KMS `GenerateDataKey` request shape, `KMSCipherTextKey` / `KMSCipherTextHash`
+  JSON, the `Challenge` decrypt->re-encrypt transform, and AES-256-GCM vectors.

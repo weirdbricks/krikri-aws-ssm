@@ -25,6 +25,8 @@ document and implement:
   including base64-in-band file transfer.
 
 This project makes no clean-room claim. Per-file provenance notes are added
-when logic is transliterated rather than re-derived; if any Apache-2.0 source
-is transliterated, the Apache License 2.0 text is included alongside this
-NOTICE, as that license requires.
+when logic is transliterated rather than re-derived. The phase 1-4 codec,
+reliability (Jacobson/Karels RTO, ack rules) and handshake JSON are
+transliterated from `aws/session-manager-plugin`; the Apache License 2.0 text
+is therefore included in `LICENSE-APACHE-2.0` alongside this NOTICE, as that
+license requires.
