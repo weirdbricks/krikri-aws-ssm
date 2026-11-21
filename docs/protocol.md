@@ -73,8 +73,15 @@ rejects any other value instead of trusting it as an offset.
 | `output_stream_data` | agent -> client | output, handshake, exit code |
 | `acknowledge` | both | confirms one sequence number |
 | `channel_closed` | agent -> client | session over; JSON body has `Output` |
-| `start_publication` | gateway -> client | may start sending |
-| `pause_publication` | gateway -> client | stop sending |
+| `start_publication` | gateway -> client | advisory resume hint |
+| `pause_publication` | gateway -> client | advisory pause hint |
+
+`start_publication` and `pause_publication` are **not** meaningful flow control
+for the client: the reference plugin's `OutputMessageHandler`
+(`src/datachannel/streaming.go`) returns nil for both and keeps writing.
+Honouring them throttled a live session's input to roughly 30 KiB/s (one
+1024-byte message per round trip), so this shard accepts and ignores both.
+Real backpressure is the agent's acknowledgement stream.
 
 ## Payload types
 

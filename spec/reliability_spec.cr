@@ -54,7 +54,7 @@ describe KrikriAwsSsm::Reliability do
     assert_equal 0, reliability.pending
   end
 
-  it "clamps the RTO to 50ms..30s" do
+  it "clamps the RTO to 50ms..1s, matching config.go's MaxTransmissionTimeout" do
     clock = Time::Span.zero
     reliability = KrikriAwsSsm::Reliability.new(now: -> { clock })
     50.times do
@@ -69,7 +69,18 @@ describe KrikriAwsSsm::Reliability do
     reliability.track(slow, Bytes[2])
     clock += 2.minutes
     reliability.acknowledge(slow)
-    assert_equal 30.seconds, reliability.retransmission_timeout
+    assert_equal 1.second, reliability.retransmission_timeout
+  end
+
+  it "stops retransmitting the oldest entry at the reference buffer capacity" do
+    reliability = KrikriAwsSsm::Reliability.new
+    capacity = KrikriAwsSsm::Reliability::OUTGOING_BUFFER_CAPACITY
+    (capacity + 5).times do
+      reliability.track(reliability.allocate, Bytes[1])
+    end
+
+    assert_equal capacity, reliability.pending
+    assert_equal 5_i64, reliability.pending_sequences.first
   end
 
   it "returns false for an already acknowledged sequence" do

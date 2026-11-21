@@ -201,7 +201,7 @@ describe KrikriAwsSsm::Session do
     end
   end
 
-  it "blocks writes while publication is paused and resumes them on start_publication" do
+  it "keeps writing while publication is paused, matching the reference plugin" do
     gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
     gateway.agent_options = SessionSpecData.quiet_agent_options
     begin
@@ -210,27 +210,16 @@ describe KrikriAwsSsm::Session do
         agent = receive_with_timeout(gateway.agents)
         receive_with_timeout(agent.handshake_responses)
 
+        # streaming.go's OutputMessageHandler returns nil for both message
+        # types; blocking here throttled a real agent to ~30 KiB/s.
         agent.pause_publication
         sleep 100.milliseconds
-
-        written = Channel(Nil).new(1)
-        spawn do
-          session.write("hi")
-          written.send(nil)
-        end
-        select
-        when written.receive
-          flunk("write returned while publication was paused")
-        when timeout(200.milliseconds)
-        end
+        session.write("hi")
+        assert_equal "hi", String.new(receive_with_timeout(agent.received_input))
 
         agent.start_publication
-        select
-        when written.receive
-        when timeout(2.seconds)
-          flunk("write stayed blocked after start_publication")
-        end
-        assert_equal "hi", String.new(receive_with_timeout(agent.received_input))
+        session.write("bye")
+        assert_equal "bye", String.new(receive_with_timeout(agent.received_input))
       ensure
         session.terminate
       end
@@ -389,6 +378,28 @@ describe KrikriAwsSsm::Session do
           break if output.includes?("STREAM-DONE")
         end
         assert_includes output, "STREAM-DONE"
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
+  it "keeps processing acknowledgements while output is unread" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    begin
+      session = KrikriAwsSsm::Session.open(SessionSpecData.settings(gateway))
+      begin
+        agent = receive_with_timeout(gateway.agents)
+        # Unread output must not wedge the websocket reader: during an
+        # upload nothing calls Session#read?, and the reader still has to
+        # consume the agent's acknowledgements.
+        10.times { agent.send_output("unread") }
+        sleep 100.milliseconds
+        session.write("after-output")
+        assert wait_until(3.seconds) { session.pending == 0 }
       ensure
         session.terminate
       end

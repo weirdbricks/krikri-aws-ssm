@@ -38,6 +38,12 @@ module KrikriAwsSsm
   # mutex-protected), and retransmit/ping/idle fibers keep the channel alive.
   # `read?` returns nil once the session is closed and drained.
   class Session
+    # Output buffered so the websocket reader can keep consuming frames
+    # (notably acknowledgements) while a caller is not reading output - for
+    # example during an upload. An unbuffered channel blocked the reader on
+    # the first output frame and stalled large streams on a real agent.
+    OUTPUT_QUEUE_DEPTH = 1024
+
     getter session_id : String
     getter client_id : String
     getter close_reason : CloseReason?
@@ -48,7 +54,7 @@ module KrikriAwsSsm
     getter error : Exception?
     getter session_type : String?
 
-    @output = Channel(Output).new
+    @output = Channel(Output).new(OUTPUT_QUEUE_DEPTH)
     @inbound = InboundSequencer(Message).new
     @reliability = Reliability.new
     @write_mutex = Mutex.new
@@ -60,7 +66,6 @@ module KrikriAwsSsm
     @handshake_notified = false
     @handshake_done = Channel(Nil).new(1)
     @handshake_error : Exception?
-    @pause_channel : Channel(Nil)?
     @last_inbound = Time.monotonic
     @generation = 0
     @ws : HTTP::WebSocket?
@@ -97,7 +102,6 @@ module KrikriAwsSsm
 
     def write(bytes : Bytes) : Nil
       raise_closed if closed?
-      wait_for_publication
       return if bytes.empty?
 
       Chunker.chunks(bytes, @settings.chunk_size).each do |chunk|
@@ -109,6 +113,12 @@ module KrikriAwsSsm
 
     def write(text : String) : Nil
       write(text.to_slice)
+    end
+
+    # Outbound messages still awaiting acknowledgement. Diagnostic seam, and
+    # what a send-window implementation would poll.
+    def pending : Int32
+      @reliability.pending
     end
 
     # Ordered stdout/stderr bytes, or nil once closed and drained.
@@ -157,8 +167,7 @@ module KrikriAwsSsm
         @closed = false
         @close_reason = nil
         @error = nil
-        @pause_channel = nil
-        @output = Channel(Output).new
+        @output = Channel(Output).new(OUTPUT_QUEUE_DEPTH)
         @handshake_done = Channel(Nil).new(1)
         @handshake_notified = false
         @handshake_complete = true
@@ -306,10 +315,10 @@ module KrikriAwsSsm
       when MessageType::CHANNEL_CLOSED
         @channel_output = ChannelClosedContent.from_json(String.new(message.payload)).output
         close!(CloseReason::AgentClosed)
-      when MessageType::START_PUBLICATION
-        start_publication
-      when MessageType::PAUSE_PUBLICATION
-        pause_publication
+      when MessageType::START_PUBLICATION, MessageType::PAUSE_PUBLICATION
+        # Advisory only. The reference plugin's OutputMessageHandler ignores
+        # both message types, and blocking writes on a real agent's pause
+        # throttled input to about 30 KiB/s: see docs/protocol.md.
       else
         # Unknown message types are ignored, matching OutputMessageHandler.
       end
@@ -600,25 +609,6 @@ module KrikriAwsSsm
 
     # --- lifecycle ---------------------------------------------------------
 
-    private def pause_publication : Nil
-      @state_mutex.synchronize { @pause_channel ||= Channel(Nil).new }
-    end
-
-    private def start_publication : Nil
-      channel = @state_mutex.synchronize do
-        pending = @pause_channel
-        @pause_channel = nil
-        pending
-      end
-      channel.try(&.close)
-    end
-
-    private def wait_for_publication : Nil
-      while channel = @state_mutex.synchronize { @pause_channel }
-        channel.receive?
-      end
-    end
-
     private def close!(reason : CloseReason, error : Exception? = nil) : Nil
       first = @state_mutex.synchronize do
         next false if @closed
@@ -631,7 +621,6 @@ module KrikriAwsSsm
 
       @handshake_error ||= error
       notify_handshake
-      start_publication
       quietly { @ws.try(&.close) }
       quietly { @io.try(&.close) }
       @output.close

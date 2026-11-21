@@ -12,11 +12,15 @@ module KrikriAwsSsm
     INITIAL_SRTT         = 100.milliseconds
     INITIAL_RTO          = 200.milliseconds
     MIN_RTO              = 50.milliseconds
-    MAX_RTO              = 30.seconds
+    MAX_RTO              = 1.second
     CLOCK_GRANULARITY    = 10.milliseconds
     RTT_ALPHA            = 0.125
     RTT_BETA             =  0.25
     DEFAULT_MAX_ATTEMPTS = 3_000
+    # Reference plugin: config.go's OutgoingMessageBufferCapacity. The oldest
+    # unacknowledged message stops being retransmitted once the buffer is
+    # full; sends are never blocked.
+    OUTGOING_BUFFER_CAPACITY = 10_000
 
     record Pending, bytes : Bytes, sequence : Int64, sent_at : Time::Span, attempts : Int32
 
@@ -48,6 +52,7 @@ module KrikriAwsSsm
 
     def track(sequence : Int64, bytes : Bytes) : Nil
       @mutex.synchronize do
+        @queue.shift if @queue.size >= OUTGOING_BUFFER_CAPACITY
         @queue << Pending.new(bytes, sequence, @now.call, 0)
       end
     end
