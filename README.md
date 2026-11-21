@@ -79,6 +79,12 @@ CI. `terraform/` provisions the SSM-only AL2023 target, a KMS key whose
 preferences document mandates encryption, and a role to assume; destroy it
 after each validation round.
 
+Downstream tests drive sessions in-process through the fake gateway/agent
+harness: `require "krikri-aws-ssm/testing"`. `FakeAgent::Options#shell_env`
+merges extra variables into the agent's pty shell (a stub `sudo`, a PATH), and
+`FakeGateway#control_failure` answers every SSM control-plane action with a
+given status and body.
+
 Development deps mirror krikri: `ameba` 1.7.0 and the
 `weirdbricks/minitest.cr` fork (`v1.7.0-weirdbricks.2`).
 

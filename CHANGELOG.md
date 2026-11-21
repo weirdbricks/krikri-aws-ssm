@@ -16,6 +16,11 @@
   suite covering command execution, KMS-encrypted sessions, a 1 MiB round trip
   and `TerminateSession` cleanup, plus a real `AssumeRole` profile.
 - Still planned: the krikri transport integration (phase 8).
+- Fake harness for downstream (krikri) integration tests: the
+  `require "krikri-aws-ssm/testing"` entrypoint now exists, the agent's pty
+  shell accepts extra environment through `FakeAgent::Options#shell_env`, and
+  `FakeGateway#control_failure` answers every control-plane action with a
+  chosen status and body so a spec can pin the client's error mapping.
 
 ## 0.1.0
 

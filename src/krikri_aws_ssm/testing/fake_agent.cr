@@ -25,6 +25,10 @@ module KrikriAwsSsm::Testing
       # First delivery of these inbound sequences is dropped without an ack,
       # which exercises the client's retransmission queue.
       property drop_first_delivery : Set(Int64) = Set(Int64).new
+      # Extra environment for the pty shell (merged over this process's
+      # own), so a spec can put a stub `sudo` or a PATH on the "target"
+      # without mutating the test process's ENV.
+      property shell_env : Hash(String, String)? = nil
     end
 
     getter open_messages = Channel(JSON::Any).new(8)
@@ -333,8 +337,10 @@ module KrikriAwsSsm::Testing
       @shell_started = true
       pty = Pty.new
       @pty = pty
+      shell_env = {"TERM" => "dumb"}
+      @options.shell_env.try &.each { |name, value| shell_env[name] = value }
       @process = Process.new(shell, input: pty.slave, output: pty.slave, error: pty.slave,
-        env: {"TERM" => "dumb"})
+        env: shell_env)
       pty.close_slave
       @pump_done = Channel(Nil).new(1)
       spawn { pump_shell_output(pty) }

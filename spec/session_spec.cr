@@ -276,6 +276,20 @@ describe KrikriAwsSsm::Session do
     end
   end
 
+  it "answers SSM control-plane actions with the configured failure" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.control_failure = {400,
+                               %({"__type":"TargetNotConnected","message":"i-0123456789 is not connected"})}
+    begin
+      error = assert_raises(KrikriAwsSsm::TargetNotConnected) do
+        KrikriAwsSsm::Session.open(SessionSpecData.settings(gateway))
+      end
+      assert_includes error.message.to_s, "is not connected"
+    ensure
+      gateway.close
+    end
+  end
+
   it "runs a real pty shell" do
     options = SessionSpecData.quiet_agent_options
     options.shell = "/bin/sh"
@@ -295,6 +309,34 @@ describe KrikriAwsSsm::Session do
           break if output.includes?("krikri-ssm-pty")
         end
         assert_includes output, "krikri-ssm-pty"
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
+  it "passes shell_env to the pty shell" do
+    options = SessionSpecData.quiet_agent_options
+    options.shell = "/bin/sh"
+    options.shell_env = {"KRIKRI_SSM_TEST_ENV" => "from-harness"}
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS, options)
+    begin
+      session = KrikriAwsSsm::Session.open(SessionSpecData.settings(gateway))
+      begin
+        receive_with_timeout(gateway.agents)
+        session.write("printf '%s\\n' \"$KRIKRI_SSM_TEST_ENV\"\n")
+
+        output = ""
+        deadline = Time.monotonic + 5.seconds
+        while Time.monotonic < deadline
+          chunk = read_with_timeout(session, deadline - Time.monotonic).try(&.bytes)
+          break unless chunk
+          output += String.new(chunk)
+          break if output.includes?("from-harness")
+        end
+        assert_includes output, "from-harness"
       ensure
         session.terminate
       end

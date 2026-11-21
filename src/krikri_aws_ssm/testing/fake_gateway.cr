@@ -21,6 +21,10 @@ module KrikriAwsSsm::Testing
     property credentials : Credentials
     property kms_plaintext_key : Bytes
     property kms_ciphertext_blob : Bytes
+    # When set, every SSM control-plane action answers with this status and
+    # body instead of its normal reply, so a spec can pin the client's
+    # error mapping (TargetNotConnected, AccessDeniedException, ...).
+    property control_failure : {Int32, String}? = nil
 
     getter control_requests = Channel(HTTP::Request).new(32)
     getter upgrade_requests = Channel(HTTP::Request).new(8)
@@ -88,6 +92,11 @@ module KrikriAwsSsm::Testing
 
       if service == "kms"
         handle_kms(context, action, body)
+        return
+      end
+
+      if failure = @control_failure
+        respond(context, failure[0], failure[1])
         return
       end
 

@@ -1,8 +1,7 @@
 require "minitest/autorun"
 require "http/server"
 require "../src/krikri-aws-ssm"
-require "../src/krikri_aws_ssm/testing/sigv4_verifier"
-require "../src/krikri_aws_ssm/testing/fake_gateway"
+require "../src/krikri-aws-ssm/testing"
 
 # A tiny capture-and-reply HTTP server for control-plane specs.
 class TestHttpServer
