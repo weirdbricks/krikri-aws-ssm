@@ -33,6 +33,12 @@ module KrikriAwsSsm
   class SessionTimeout < Error
   end
 
+  # Unread session output exceeded `Settings#output_buffer_limit`. The reader
+  # cannot block on delivery without stalling acknowledgements, so an unread
+  # stream fails the session instead of growing without bound.
+  class OutputBufferExceeded < Error
+  end
+
   # No usable credentials were found in the credential chain.
   class CredentialsError < Error
     def initialize(message = "Unable to locate credentials")

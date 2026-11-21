@@ -59,6 +59,40 @@ describe KrikriAwsSsm::Session do
     end
   end
 
+  it "disables Nagle on the data-channel socket" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    begin
+      session = KrikriAwsSsm::Session.open(SessionSpecData.settings(gateway))
+      begin
+        # A frame is several small writes below one MSS; with Nagle on, a
+        # sustained upload runs at about one MSS per delayed-ACK round trip.
+        assert session.transport.as(TCPSocket).tcp_nodelay?
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
+  it "leaves Nagle on when the setting disables it, so an A/B can measure it" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    begin
+      settings = SessionSpecData.settings(gateway)
+      settings.tcp_nodelay = false
+      session = KrikriAwsSsm::Session.open(settings)
+      begin
+        refute session.transport.as(TCPSocket).tcp_nodelay?
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
   it "completes the handshake and separates stdout, stderr, exit code and channel_closed" do
     gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
     gateway.agent_options = SessionSpecData.quiet_agent_options
@@ -93,6 +127,28 @@ describe KrikriAwsSsm::Session do
         assert_nil read_with_timeout(session)
         assert_equal 3, session.exit_code
         assert_equal "bye", session.channel_output
+        assert_equal KrikriAwsSsm::CloseReason::AgentClosed, session.close_reason
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
+  it "drains buffered output before reporting a closed session" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    begin
+      session = KrikriAwsSsm::Session.open(SessionSpecData.settings(gateway))
+      begin
+        agent = receive_with_timeout(gateway.agents)
+        receive_with_timeout(agent.handshake_responses)
+
+        agent.send_output("last")
+        agent.send_channel_closed("")
+        assert_equal "last", String.new(read_required(session).bytes)
+        assert_nil read_with_timeout(session)
         assert_equal KrikriAwsSsm::CloseReason::AgentClosed, session.close_reason
       ensure
         session.terminate
@@ -422,6 +478,158 @@ describe KrikriAwsSsm::Session do
         session.write("after-acks")
         assert_equal "after-acks",
           String.new(receive_with_timeout(agent.received_input))
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
+  it "keeps acknowledging input while far more output is unread than the old queue held" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    begin
+      session = KrikriAwsSsm::Session.open(SessionSpecData.settings(gateway))
+      begin
+        agent = receive_with_timeout(gateway.agents)
+        receive_with_timeout(agent.handshake_responses)
+
+        # A bounded output queue (1024 frames) blocked the websocket reader
+        # here, so the agent's acknowledgements were never consumed and an
+        # upload's send window could never drain. Wait until the agent has
+        # handed every frame to the socket: more than the old queue held, so
+        # the old code's reader is parked and fails the pending assertion
+        # instead of hanging the test.
+        spawn do
+          1_500.times { agent.send_output("x" * 1024) }
+        rescue
+        end
+        assert wait_until(5.seconds) { agent.outputs_sent.get >= 1_500 },
+          "the agent could not hand its output to the socket"
+
+        session.write("after-output")
+        assert wait_until(10.seconds) { session.pending == 0 },
+          "acknowledgements stopped while output was unread"
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
+  it "waits for acknowledgements instead of dropping the oldest unacked message" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    begin
+      settings = SessionSpecData.settings(gateway)
+      settings.send_window = 2
+      session = KrikriAwsSsm::Session.open(settings)
+      begin
+        agent = receive_with_timeout(gateway.agents)
+        receive_with_timeout(agent.handshake_responses)
+        agent.hold_acks
+
+        writer = Channel(Exception?).new(1)
+        spawn do
+          session.write(Bytes.new(4 * 1024))
+          writer.send(nil)
+        rescue ex
+          writer.send(ex)
+        end
+
+        assert wait_until(2.seconds) { session.pending == 2 }
+        select
+        when _ = writer.receive
+          flunk "write returned while the send window was full"
+        when timeout(200.milliseconds)
+        end
+
+        agent.release_acks
+        select
+        when error = writer.receive
+          assert_nil error
+        when timeout(5.seconds)
+          flunk "write did not resume after acknowledgements were released"
+        end
+        assert wait_until(3.seconds) { session.pending == 0 }
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
+  it "closes a session whose acknowledgements stall while output keeps flowing" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    begin
+      settings = SessionSpecData.settings(gateway, idle_timeout: 300.milliseconds)
+      settings.send_window = 1
+      session = KrikriAwsSsm::Session.open(settings)
+      begin
+        agent = receive_with_timeout(gateway.agents)
+        receive_with_timeout(agent.handshake_responses)
+        agent.hold_acks
+
+        # Keep inbound frames arriving so the idle deadline never fires; only
+        # the missing acknowledgement can explain the close.
+        spawn do
+          loop do
+            agent.send_output(".")
+            sleep 20.milliseconds
+          end
+        rescue
+        end
+
+        writer = Channel(Exception?).new(1)
+        spawn do
+          session.write(Bytes.new(4 * 1024))
+          writer.send(nil)
+        rescue ex
+          writer.send(ex)
+        end
+        assert wait_until(2.seconds) { session.pending == 1 }
+
+        assert wait_until(5.seconds) { session.closed? }
+        assert_equal KrikriAwsSsm::CloseReason::SessionTimeout, session.close_reason
+        assert_match(/no acknowledgement/,
+          session.error.try(&.message).to_s)
+        select
+        when error = writer.receive
+          assert_instance_of KrikriAwsSsm::ChannelClosed, error
+        when timeout(5.seconds)
+          flunk "write stayed blocked after the session closed"
+        end
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
+  it "fails the session when unread output exceeds its buffer limit" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    begin
+      settings = SessionSpecData.settings(gateway)
+      settings.output_buffer_limit = 16
+      session = KrikriAwsSsm::Session.open(settings)
+      begin
+        agent = receive_with_timeout(gateway.agents)
+        receive_with_timeout(agent.handshake_responses)
+
+        3.times do
+          agent.send_output("0123456789")
+        rescue
+          break
+        end
+        assert wait_until(3.seconds) { session.closed? }
+        assert_instance_of KrikriAwsSsm::OutputBufferExceeded, session.error
+        assert_equal KrikriAwsSsm::CloseReason::ProtocolError, session.close_reason
       ensure
         session.terminate
       end

@@ -72,15 +72,52 @@ describe KrikriAwsSsm::Reliability do
     assert_equal 1.second, reliability.retransmission_timeout
   end
 
-  it "stops retransmitting the oldest entry at the reference buffer capacity" do
+  it "keeps every unacknowledged message instead of dropping the oldest" do
     reliability = KrikriAwsSsm::Reliability.new
     capacity = KrikriAwsSsm::Reliability::OUTGOING_BUFFER_CAPACITY
     (capacity + 5).times do
       reliability.track(reliability.allocate, Bytes[1])
     end
 
-    assert_equal capacity, reliability.pending
-    assert_equal 5_i64, reliability.pending_sequences.first
+    # The reference plugin drops the head here, which abandons a message the
+    # agent is still waiting for; the writer waits for room instead.
+    assert_equal capacity + 5, reliability.pending
+    assert_equal 0_i64, reliability.pending_sequences.first
+  end
+
+  it "reports transfer statistics and wakes a writer when an ack frees room" do
+    clock = Time::Span.zero
+    reliability = KrikriAwsSsm::Reliability.new(now: -> { clock })
+    sequence = reliability.allocate
+    reliability.track(sequence, Bytes.new(10))
+    clock += 25.milliseconds
+
+    assert_equal 1_i64, reliability.stats.messages_sent
+    assert_equal 10_i64, reliability.stats.bytes_sent
+    assert_equal 1, reliability.stats.peak_pending
+
+    assert reliability.acknowledge(sequence)
+    stats = reliability.stats
+    assert_equal 1_i64, stats.acks
+    assert_equal 10_i64, stats.bytes_acked
+    assert_equal 1, stats.ack_samples
+    assert_equal 25.milliseconds, stats.ack_min
+    assert_equal 0, stats.pending
+    assert stats.acks_per_second > 0.0
+  end
+
+  it "does not sample the round trip of a retransmitted message" do
+    clock = Time::Span.zero
+    reliability = KrikriAwsSsm::Reliability.new(now: -> { clock })
+    sequence = reliability.allocate
+    reliability.track(sequence, Bytes[1])
+    clock += 300.milliseconds
+    reliability.retransmission
+    clock += 20.milliseconds
+    reliability.acknowledge(sequence)
+
+    assert_equal 0, reliability.stats.ack_samples
+    assert_equal 1_i64, reliability.stats.retransmissions
   end
 
   it "returns false for an already acknowledged sequence" do

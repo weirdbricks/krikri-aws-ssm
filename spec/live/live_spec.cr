@@ -22,9 +22,12 @@ module LiveSpecData
   end
 
   def self.settings : KrikriAwsSsm::Settings
-    KrikriAwsSsm::Settings.new(target,
+    settings = KrikriAwsSsm::Settings.new(target,
       region: region, connect_timeout: 30.seconds, idle_timeout: 120.seconds,
       retries: 2)
+    # SSM_LIVE_NO_NAGLE=1 runs the throughput test without the fix, for an A/B.
+    settings.tcp_nodelay = false if ENV["SSM_LIVE_NO_NAGLE"]? == "1"
+    settings
   end
 
   SETUP = "stty -echo -onlcr 2>/dev/null; PS1=''; export TERM=dumb; unset PROMPT_COMMAND\r"
@@ -60,6 +63,47 @@ module LiveSpecData
     end
     text
   end
+
+  # Newline-wrap base64 the way krikri streams it: 3000 bytes per line, under
+  # the pty's 4096-byte canonical input limit.
+  def self.wrap(encoded : String) : Array(String)
+    lines = Array(String).new(encoded.bytesize // 3000 + 1)
+    offset = 0
+    while offset < encoded.bytesize
+      count = Math.min(3000, encoded.bytesize - offset)
+      lines << encoded[offset, count]
+      offset += count
+    end
+    lines
+  end
+
+  # Bytes written by wrapping *encoded* into 3000-byte lines.
+  def self.wrapped_size(encoded : String) : Int64
+    return 0_i64 if encoded.empty?
+    encoded.bytesize.to_i64 + (encoded.bytesize + 2999_i64) // 3000_i64
+  end
+
+  # Print the shard's own counters for a transfer so a slow live run can be
+  # diagnosed without guessing: message rate, ack rate, send-window high-water
+  # mark, retransmissions and the round-trip distribution.
+  def self.report(label : String, before : KrikriAwsSsm::Reliability::Stats,
+                  after : KrikriAwsSsm::Reliability::Stats,
+                  bytes : Int64, elapsed : Time::Span) : Nil
+    seconds = elapsed.total_seconds
+    kib = seconds > 0 ? bytes / seconds / 1024 : 0.0
+    messages = after.messages_sent - before.messages_sent
+    acks = after.acks - before.acks
+    retransmissions = after.retransmissions - before.retransmissions
+    puts "#{label}: #{bytes} bytes in #{seconds.round(2)}s (#{kib.round(1)} KiB/s), " \
+         "#{messages} messages (#{(seconds > 0 ? messages / seconds : 0.0).round(1)}/s), " \
+         "acks=#{acks} (#{(seconds > 0 ? acks / seconds : 0.0).round(1)}/s), " \
+         "retransmissions=#{retransmissions}, session_peak_pending=#{after.peak_pending}, " \
+         "rtt median=#{format_span(after.ack_median)} p95=#{format_span(after.ack_p95)}"
+  end
+
+  def self.format_span(span : Time::Span?) : String
+    span ? "#{span.total_milliseconds.round(1)}ms" : "n/a"
+  end
 end
 
 describe "live SSM" do
@@ -88,27 +132,97 @@ describe "live SSM" do
       encoded = Base64.strict_encode(payload)
       # Pty canonical input is capped at 4096 bytes per line, so stream base64
       # in 3000-byte lines; `head -c` gives a deterministic EOF.
-      data = encoded.chars.each_slice(3000).map(&.join).join("\n") + "\n"
+      lines = LiveSpecData.wrap(encoded)
+      data = lines.join("\n") + "\n"
+      wrapped = LiveSpecData.wrapped_size(encoded)
       begin_marker = "__KRIKRI_UP_#{Random.rand(1_000_000)}__"
       ready_marker = "__KRIKRI_READY_#{Random.rand(1_000_000)}__"
       end_marker = "__KRIKRI_UP_END_#{Random.rand(1_000_000)}__"
-      started = Time.monotonic
-      session.write("printf '%s\\n%s\\n' #{begin_marker} #{ready_marker}; " \
-                    "head -c #{data.bytesize} | base64 -d > /tmp/krikri-live.bin; " \
+      # READY comes from inside the pipeline: a live agent drops bytes written
+      # before `head` is reading (see krikri's exec_script_locked).
+      session.write("printf '%s\\n' #{begin_marker}; " \
+                    "( printf '%s\\n' #{ready_marker} >&2; exec head -c #{wrapped} ) | base64 -d > /tmp/krikri-live.bin; " \
                     "md5sum /tmp/krikri-live.bin; " \
                     "printf '\\n%s:%s\\n' #{end_marker} \"$?\"\r")
       LiveSpecData.read_until(session, /#{ready_marker}/, 30.seconds)
+      before = session.stats
+      started = Time.monotonic
       session.write(data)
       upload = LiveSpecData.read_until(session, /#{end_marker}:/, 180.seconds, begin_marker)
       elapsed = Time.monotonic - started
       expected = Digest::MD5.hexdigest(payload)
       assert_includes upload, expected
+      LiveSpecData.report("live 1MiB upload", before, session.stats, wrapped, elapsed)
 
       download_marker = "__KRIKRI_DOWN_#{Random.rand(1_000_000)}__"
       session.write("base64 /tmp/krikri-live.bin; printf '\\n%s\\n' #{download_marker}\r")
       download = LiveSpecData.read_until(session, /#{download_marker}/, 180.seconds)
       assert_includes download.delete(" \t\r\n"), encoded
       puts "live throughput: #{(payload.size * 2 / elapsed.total_seconds / 1024 / 1024).round(2)} MiB/s"
+    ensure
+      session.terminate
+    end
+  end
+
+  # Issue #1692: a cold krikri/SSM run was dominated by one ~13MB upload that
+  # crossed the channel at ~50 KiB/s. A 1MiB burst was fast and a 4MiB stream
+  # collapsed, which fits Nagle plus delayed ACK on the data-channel socket
+  # (one MSS per round trip). The shard now sets TCP_NODELAY and waits for
+  # acknowledgements instead of dropping the oldest unacked message. This test
+  # pins the sustained rate and prints the counters a diagnosis needs.
+  # SSM_LIVE_NO_NAGLE=1 runs the same test without the fix for an A/B.
+  it "sustains a multi-megabyte upload after the first megabyte" do
+    skip "set KRIKRI_SSM_LIVE=1 and SSM_TARGET" unless LiveSpecData.enabled?
+    session = KrikriAwsSsm::Session.open(LiveSpecData.settings)
+    begin
+      session.write(LiveSpecData::SETUP)
+      LiveSpecData.run(session, "true")
+
+      total = (ENV["SSM_LIVE_SUSTAINED_BYTES"]? || "4194304").to_i
+      floor_kib = (ENV["SSM_LIVE_MIN_KIBPS"]? || "64").to_f
+      payload = Bytes.new(total) { |index| (index % 251).to_u8 }
+      encoded = Base64.strict_encode(payload)
+      lines = LiveSpecData.wrap(encoded)
+      wrapped = LiveSpecData.wrapped_size(encoded)
+
+      begin_marker = "__KRIKRI_SUSTAIN_#{Random.rand(1_000_000)}__"
+      ready_marker = "__KRIKRI_SUSTAIN_READY_#{Random.rand(1_000_000)}__"
+      end_marker = "__KRIKRI_SUSTAIN_END_#{Random.rand(1_000_000)}__"
+      session.write("printf '%s\\n' #{begin_marker}; " \
+                    "( printf '%s\\n' #{ready_marker} >&2; exec head -c #{wrapped} ) | base64 -d > /tmp/krikri-live-sustained.bin; " \
+                    "md5sum /tmp/krikri-live-sustained.bin; " \
+                    "printf '\\n%s:%s\\n' #{end_marker} \"$?\"\r")
+      LiveSpecData.read_until(session, /#{ready_marker}/, 30.seconds)
+
+      before = session.stats
+      started = Time.monotonic
+      first_mib_at = nil
+      written = 0_i64
+      lines.each do |line|
+        session.write(line + "\n")
+        written += line.bytesize + 1
+        if first_mib_at.nil? && written >= 1_048_576
+          first_mib_at = Time.monotonic
+        end
+      end
+      handed_off = Time.monotonic
+      upload = LiveSpecData.read_until(session, /#{end_marker}:/, 240.seconds, begin_marker)
+      finished = Time.monotonic
+
+      assert_includes upload, Digest::MD5.hexdigest(payload)
+      if burst = first_mib_at
+        burst_elapsed = burst - started
+        burst_kib = 1_048_576 / burst_elapsed.total_seconds / 1024
+        puts "live burst: first 1 MiB handed to the socket in " \
+             "#{burst_elapsed.total_seconds.round(2)}s (#{burst_kib.round(1)} KiB/s)"
+      end
+      puts "live sustained: all #{written} bytes handed to the socket in " \
+           "#{(handed_off - started).total_seconds.round(2)}s"
+
+      LiveSpecData.report("live sustained upload", before, session.stats, written, finished - started)
+      sustained_kib = written / (finished - started).total_seconds / 1024
+      assert sustained_kib >= floor_kib,
+        "sustained upload was #{sustained_kib.round(1)} KiB/s, below the #{floor_kib} KiB/s floor"
     ensure
       session.terminate
     end

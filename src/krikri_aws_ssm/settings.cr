@@ -1,4 +1,5 @@
 require "./credentials"
+require "./reliability"
 
 module KrikriAwsSsm
   # Everything `Client` and `Session` need to talk to SSM.
@@ -11,6 +12,14 @@ module KrikriAwsSsm
     # Bridge's liveness improvement over the plugin's 5-minute blind ping.
     DEFAULT_PING_INTERVAL = 30.seconds
     DEFAULT_IDLE_TIMEOUT  = 120.seconds
+    # Reference plugin: config.go's OutgoingMessageBufferCapacity. A writer
+    # waits for acknowledgements once this many messages are in flight.
+    DEFAULT_SEND_WINDOW = Reliability::OUTGOING_BUFFER_CAPACITY
+    # Output kept for a caller that is not reading. The websocket reader never
+    # blocks on it (that would stop acknowledgement processing and deadlock an
+    # upload), so an unread stream is capped and closes the session with
+    # OutputBufferExceeded instead of growing without bound.
+    DEFAULT_OUTPUT_BUFFER_LIMIT = 64_i64 * 1024 * 1024
 
     property target : String
     property region : String
@@ -33,6 +42,13 @@ module KrikriAwsSsm
     property chunk_size : Int32
     property ping_interval : Time::Span
     property idle_timeout : Time::Span
+    # Unacknowledged messages a writer may have in flight before it waits.
+    property send_window : Int32
+    # Bytes of unread output buffered before the session is closed.
+    property output_buffer_limit : Int64
+    # Disable Nagle on the data-channel socket. Only turn this off to measure
+    # the difference; a sustained upload collapses without it.
+    property? tcp_nodelay : Bool
 
     def initialize(@target : String, @region : String = DEFAULT_REGION,
                    @profile : String? = nil, @endpoint_url : String? = nil,
@@ -46,10 +62,17 @@ module KrikriAwsSsm
                    @client_version : String = "1.0.0",
                    @chunk_size : Int32 = DEFAULT_CHUNK_SIZE,
                    @ping_interval : Time::Span = DEFAULT_PING_INTERVAL,
-                   @idle_timeout : Time::Span = DEFAULT_IDLE_TIMEOUT)
+                   @idle_timeout : Time::Span = DEFAULT_IDLE_TIMEOUT,
+                   @send_window : Int32 = DEFAULT_SEND_WINDOW,
+                   @output_buffer_limit : Int64 = DEFAULT_OUTPUT_BUFFER_LIMIT,
+                   @tcp_nodelay : Bool = true)
       raise ConfigurationError.new("target must not be empty") if @target.empty?
       raise ConfigurationError.new("region must not be empty") if @region.empty?
       raise ConfigurationError.new("chunk_size must be positive") unless @chunk_size > 0
+      raise ConfigurationError.new("send_window must be positive") unless @send_window > 0
+      unless @output_buffer_limit > 0
+        raise ConfigurationError.new("output_buffer_limit must be positive")
+      end
     end
   end
 end

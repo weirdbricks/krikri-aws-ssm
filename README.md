@@ -80,6 +80,12 @@ CI. `terraform/` provisions the SSM-only AL2023 target, a KMS key whose
 preferences document mandates encryption, and a role to assume; destroy it
 after each validation round.
 
+The throughput test streams `SSM_LIVE_SUSTAINED_BYTES` (4 MiB by default) and
+fails below `SSM_LIVE_MIN_KIBPS` (64 KiB/s by default), printing
+`Session#stats`: message and ack rates, peak pending, retransmissions and
+round-trip percentiles. `SSM_LIVE_NO_NAGLE=1` reruns it without `TCP_NODELAY`
+for an A/B against the pre-0.2.2 behaviour.
+
 Downstream tests drive sessions in-process through the fake gateway/agent
 harness: `require "krikri-aws-ssm/testing"`. `FakeAgent::Options#shell_env`
 merges extra variables into the agent's pty shell (a stub `sudo`, a PATH), and

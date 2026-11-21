@@ -81,7 +81,8 @@ for the client: the reference plugin's `OutputMessageHandler`
 (`src/datachannel/streaming.go`) returns nil for both and keeps writing.
 Honouring them throttled a live session's input to roughly 30 KiB/s (one
 1024-byte message per round trip), so this shard accepts and ignores both.
-Real backpressure is the agent's acknowledgement stream.
+Real backpressure is the agent's acknowledgement stream, applied through the
+send window above and never by blocking this reader.
 
 ## Payload types
 
@@ -115,8 +116,50 @@ Real backpressure is the agent's acknowledgement stream.
   `seq < expected` drop without acking.
 - Chunking: 1024-byte input payloads by default (config), configurable.
 - Liveness: ping every 30s, idle deadline on any inbound frame (120s default).
-- Timers: retransmit scan 100ms, initial RTO 200ms, Jacobson/Karels clamped
-  50ms..30s, give up after 3000 attempts, 10k-message buffers.
+- Timers: retransmit scan 100ms and initial RTO 200ms (`ResendSleepInterval`,
+  `DefaultTransmissionTimeout`), give up after 3000 attempts
+  (`ResendMaxAttempt`). Jacobson/Karels uses the plugin's 1s cap
+  (`MaxTransmissionTimeout`); the 50ms floor is the bridge's, not the
+  plugin's (the plugin floors only at `ClockGranularity`, 10ms).
+- Send window: a writer waits for acknowledgements once 10,000 messages are
+  unacknowledged (`OutgoingMessageBufferCapacity`). The reference plugin
+  instead drops the oldest unacknowledged entry
+  (`AddDataToOutgoingMessageBuffer` in `src/datachannel/streaming.go`), which
+  abandons a sequence the agent is still waiting for and can stall the stream;
+  `aws-ssm-bridge` documents the same divergence. A stream with no
+  acknowledgement for `idle_timeout` closes with `SessionTimeout` so the
+  waiting writer cannot hang indefinitely.
+- Inbound RTT samples skip retransmitted messages (Karn's algorithm), so a
+  retransmission storm does not masquerade as a huge round trip. Divergence:
+  the reference plugin samples every acknowledgement, including retransmitted
+  ones.
+
+## Throughput
+
+The data channel is TCP/TLS, so the client's send path decides how fast a bulk
+upload leaves the controller.
+
+- `TCP_NODELAY` is set on the data-channel socket. A websocket frame is
+  several small writes (frame header, mask key, masked payload) and the
+  payload is usually below one MSS. Go's `net` package, and therefore the
+  reference plugin, disables Nagle by default; Crystal's `TCPSocket` does not.
+  The leading explanation for issue #1692 (a 1 MiB burst at ~1.4 MiB/s, then
+  a sustained ~30 KiB/s, about one MSS per delayed-ACK round trip) is Nagle
+  plus delayed ACK on a below-MSS stream. The live throughput test pins the
+  outcome; `Settings#tcp_nodelay` allows an A/B run.
+- Write coalescing is not the lever on the real path: `OpenSSL::SSL::Socket`
+  is already buffered and the websocket protocol flushes at the end of every
+  frame, so a `wss` frame reaches `SSL_write` as one write. Plain `ws://`
+  (the test endpoint) is unbuffered.
+- Throughput is not improved by larger chunks: `aws-ssm-bridge`'s published
+  wire notes report 8 KiB and 32 KiB chunks accepted by a live agent
+  (3.3.3572.0) and performing identically. The 1024-byte default is kept for
+  interoperability and is configurable through `Settings#chunk_size`.
+- Unread output never blocks the websocket reader. A bounded queue stopped
+  acknowledgement processing whenever output was not drained (and deadlocked
+  an upload whose writer waited for acks). Output is buffered in a growable
+  queue bounded by `Settings#output_buffer_limit`; exceeding it closes the
+  session with `OutputBufferExceeded`.
 
 ## Handshake payloads
 
@@ -183,6 +226,10 @@ Pinned by phase 1-4 specs:
 - Ack `Flags = SYN | FIN`, sequence 0, and the payload JSON shape.
 - Timer defaults from `src/config/config.go`.
 - `Size` (payload 3): acknowledged and ignored (decision above).
+- Send window waits for acks at the reference 10,000-message capacity, the
+  ack-stall close, Karn's algorithm for RTT samples (a labeled divergence),
+  `TCP_NODELAY` (issue #1692), and a growable output queue that never blocks
+  the reader.
 - Handshake request/response/complete JSON shapes, including `ActionResult:
   null`, `Errors: null`, numeric `ActionStatus`, and nanosecond
   `HandshakeTimeToComplete`.

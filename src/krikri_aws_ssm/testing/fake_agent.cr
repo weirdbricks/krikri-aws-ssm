@@ -38,13 +38,19 @@ module KrikriAwsSsm::Testing
     getter received_input = Channel(Bytes).new(1024)
     getter challenge_responses = Channel(Bytes).new(4)
     getter pings = Atomic(Int32).new(0)
+    # Output frames handed to the socket. Specs use it as a barrier instead of
+    # sleeping when they need the client to have buffered output.
+    getter outputs_sent = Atomic(Int32).new(0)
 
     @options : Options
     @out_mutex = Mutex.new
     @send_mutex = Mutex.new
+    @ack_mutex = Mutex.new
     @inbound = InboundSequencer(Message).new
     @out_sequence = 0_i64
     @dropped = Set(Int64).new
+    @acks_held = false
+    @held_acks = [] of AcknowledgeContent
     @stopped = false
     @handshake_sent = false
     @shell_started = false
@@ -69,6 +75,7 @@ module KrikriAwsSsm::Testing
     # --- frames the client should handle ----------------------------------
 
     def send_output(bytes : Bytes, payload_type : PayloadType = PayloadType::Output) : Nil
+      @outputs_sent.add(1)
       if encrypter = @encrypter
         if [PayloadType::Output.value, PayloadType::StdErr.value, PayloadType::ExitCode.value].includes?(payload_type.value)
           bytes = encrypter.encrypt(bytes)
@@ -132,6 +139,23 @@ module KrikriAwsSsm::Testing
       end
       @ws.close
     rescue
+    end
+
+    # Hold acknowledgements so a spec can watch the client's send window fill,
+    # then release them in one batch. Messages are still processed; only the
+    # acknowledgement frames are deferred.
+    def hold_acks : Nil
+      @ack_mutex.synchronize { @acks_held = true }
+    end
+
+    def release_acks : Nil
+      held = @ack_mutex.synchronize do
+        @acks_held = false
+        contents = @held_acks
+        @held_acks = [] of AcknowledgeContent
+        contents
+      end
+      held.each { |content| send_ack(content) }
     end
 
     # --- inbound ----------------------------------------------------------
@@ -298,6 +322,14 @@ module KrikriAwsSsm::Testing
     private def acknowledge(message : Message) : Nil
       content = AcknowledgeContent.new(
         message.message_type, message.message_id.to_s, message.sequence_number)
+      held = @ack_mutex.synchronize do
+        @held_acks << content if @acks_held
+        @acks_held
+      end
+      send_ack(content) unless held
+    end
+
+    private def send_ack(content : AcknowledgeContent) : Nil
       frame = Message.new(
         message_type: MessageType::ACKNOWLEDGE,
         payload: content.to_json.to_slice,
