@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.2.2 (2026-11-21)
+
+- Address the sustained-upload collapse behind issue #1692, which points at
+  Nagle plus delayed ACK: the data-channel TCP socket now sets `TCP_NODELAY`
+  (Crystal's default is Nagle on; Go, and therefore the reference plugin, has
+  it off). A frame is several writes below one MSS, so without it a large
+  upload ran at about one MSS per round trip (~30 KiB/s). The live throughput
+  test pins the rate, and `Settings#tcp_nodelay` allows an A/B run.
+- Replace the bounded output channel with a growable queue: the websocket
+  reader never waits for a caller to read output, so acknowledgements keep
+  flowing while a bulk upload is in progress. `Settings#output_buffer_limit`
+  caps the memory and a new `OutputBufferExceeded` error fails an unread
+  session instead of blocking it.
+- The send window now waits for acknowledgements instead of dropping the oldest
+  unacknowledged message at the reference plugin's 10,000-message capacity
+  (dropping the head abandons a sequence the agent is still waiting for).
+  `Settings#send_window` sets the window, and an ack-stalled stream closes with
+  `SessionTimeout` after `idle_timeout` instead of blocking a writer for the
+  whole retransmission budget.
+- Pings are serialized with data writes, and `close!` snapshots the connection
+  it is tearing down, so a `resume` racing with a drop cannot have its new
+  websocket or output queue closed by the old teardown.
+- Add `Session#stats`, a diagnostic snapshot of the outbound channel
+  (messages, bytes, acks/second, pending and peak pending, retransmissions and
+  round-trip percentiles), and an opt-in live test that pins the sustained rate
+  of a multi-megabyte upload and prints those counters.
+
 ## 0.2.1 (2026-11-21)
 
 - Keep SSM input flowing on a real agent: `pause_publication` and
