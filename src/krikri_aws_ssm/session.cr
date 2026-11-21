@@ -6,8 +6,10 @@ require "uri"
 require "./chunker"
 require "./client"
 require "./credentials"
+require "./encryption"
 require "./errors"
 require "./handshake"
+require "./kms"
 require "./message"
 require "./reliability"
 require "./settings"
@@ -63,17 +65,26 @@ module KrikriAwsSsm
     @generation = 0
     @ws : HTTP::WebSocket?
     @io : IO?
+    @kms : Kms?
+    @encrypter : Encrypter?
+    @encryption_enabled = false
 
     def self.open(settings : Settings, chain : CredentialChain = CredentialChain.default,
-                  client : Client? = nil) : Session
+                  client : Client? = nil, kms : Kms? = nil) : Session
       client ||= Client.new(settings, chain)
       info = client.start_session
-      new(settings, client, info).tap(&.connect)
+      new(settings, client, info, kms).tap(&.connect)
     end
 
-    def initialize(@settings : Settings, @client : Client, @info : SessionInfo)
+    def initialize(@settings : Settings, @client : Client, @info : SessionInfo,
+                   @kms : Kms? = nil)
       @session_id = @info.session_id
       @client_id = UUID.random.to_s
+    end
+
+    # True once the KMS handshake action succeeded and payload encryption is on.
+    def encryption_enabled? : Bool
+      @encryption_enabled
     end
 
     # Dial the data channel, send the token in the open message and wait for
@@ -340,20 +351,56 @@ module KrikriAwsSsm
         complete_handshake
       when PayloadType::Output.value
         complete_handshake if !@handshake_complete && @session_type.nil?
-        emit(Stream::Stdout, message.payload)
+        emit(Stream::Stdout, payload_bytes(message))
       when PayloadType::StdErr.value
-        emit(Stream::Stderr, message.payload)
+        emit(Stream::Stderr, payload_bytes(message))
       when PayloadType::ExitCode.value
-        @exit_code = parse_exit_code(message.payload)
+        @exit_code = parse_exit_code(payload_bytes(message))
       when PayloadType::Error.value
         @channel_output = String.new(message.payload)
       when PayloadType::EncChallengeRequest.value
-        @handshake_error = KmsUnsupported.new("the agent requested an encryption challenge")
-        notify_handshake
-        close!(CloseReason::ProtocolError)
+        handle_encryption_challenge(message)
       else
         # Size, Parameter and Flag are not exposed by this byte-stream API.
       end
+    end
+
+    # Payload types 1, 11 and 12 are AES-GCM encrypted when KMS is on; the
+    # handshake and control payloads stay clear (plugin `streaming.go`).
+    private def payload_bytes(message : Message) : Bytes
+      encrypter = @encrypter
+      return message.payload unless encrypter && @encryption_enabled && encrypted_payload?(message.payload_type)
+      encrypter.decrypt(message.payload)
+    end
+
+    private def encrypted_payload?(payload_type : UInt32) : Bool
+      payload_type == PayloadType::Output.value ||
+        payload_type == PayloadType::StdErr.value ||
+        payload_type == PayloadType::ExitCode.value
+    end
+
+    private def handle_encryption_challenge(message : Message) : Nil
+      encrypter = @encrypter
+      unless encrypter
+        @handshake_error = HandshakeFailed.new(
+          "the agent requested an encryption challenge before KMS was negotiated")
+        notify_handshake
+        close!(CloseReason::ProtocolError)
+        return
+      end
+      challenge = JSON.parse(String.new(message.payload))["Challenge"]?.try(&.as_s?)
+      raise ProtocolError.new("EncChallengeRequest is missing Challenge") unless challenge
+      plaintext = encrypter.decrypt(Base64.decode(challenge))
+      encrypted = encrypter.encrypt(plaintext)
+      response = JSON.build do |json|
+        json.object { json.field "Challenge", Base64.strict_encode(encrypted) }
+      end
+      send_input(PayloadType::EncChallengeResponse.value, response.to_slice)
+    rescue ex : ProtocolError | Base64::Error | JSON::ParseException
+      @error = ex
+      @handshake_error = ex
+      notify_handshake
+      close!(CloseReason::ProtocolError)
     end
 
     private def emit(stream : Stream, bytes : Bytes) : Nil
@@ -374,7 +421,7 @@ module KrikriAwsSsm
       request = Handshake::HandshakeRequestPayload.from_json(String.new(message.payload))
       processed = [] of Handshake::ProcessedClientAction
       errors = [] of String
-      kms_requested = false
+      kms_error : HandshakeFailed? = nil
 
       request.requested_client_actions.each do |action|
         case action.action_type
@@ -389,11 +436,18 @@ module KrikriAwsSsm
             errors << text
           end
         when ActionType::KMS_ENCRYPTION
-          kms_requested = true
-          text = "KMS session encryption is not supported by this client"
-          processed << Handshake::ProcessedClientAction.new(
-            ActionType::KMS_ENCRYPTION, ActionStatus::Failed.value, nil, text)
-          errors << text
+          begin
+            result = enable_kms_encryption(action.action_parameters)
+            processed << Handshake::ProcessedClientAction.new(
+              ActionType::KMS_ENCRYPTION, ActionStatus::Success.value, result)
+          rescue ex : Error | OpenSSL::Error | JSON::ParseException | IO::Error
+            failure = HandshakeFailed.new(
+              "Failed to process action KMSEncryption: #{ex.message}", cause: ex)
+            kms_error = failure
+            processed << Handshake::ProcessedClientAction.new(
+              ActionType::KMS_ENCRYPTION, ActionStatus::Failed.value, nil, failure.message.to_s)
+            errors << failure.message.to_s
+          end
         else
           text = "Unsupported action #{action.action_type}"
           processed << Handshake::ProcessedClientAction.new(
@@ -406,11 +460,36 @@ module KrikriAwsSsm
         @settings.client_version, processed, errors.empty? ? nil : errors)
       send_input(PayloadType::HandshakeResponse.value, response.to_json.to_slice)
 
-      if kms_requested
-        @handshake_error = KmsUnsupported.new
+      if failed = kms_error
+        @handshake_error = failed
         notify_handshake
         close!(CloseReason::ProtocolError)
       end
+    end
+
+    # Run the KMS handshake action: GenerateDataKey, split the key, and return
+    # the exact plugin JSON (`KMSCipherTextHash` marshals as null).
+    private def enable_kms_encryption(parameters : JSON::Any?) : JSON::Any
+      raise HandshakeFailed.new("KMSEncryption action is missing its parameters") unless parameters
+      request = Handshake::KMSEncryptionRequest.from_json(parameters.to_json)
+      data_key = kms_client.generate_data_key(request.kms_key_id, @session_id, @settings.target)
+      @encrypter = Encrypter.new(data_key.plaintext)
+      @encryption_enabled = true
+      JSON.parse(JSON.build do |json|
+        json.object do
+          json.field "KMSCipherTextKey", Base64.strict_encode(data_key.ciphertext_blob)
+          json.field "KMSCipherTextHash", nil
+        end
+      end)
+    end
+
+    private def kms_client : Kms
+      @kms ||= Kms.new(@client.credentials, @settings.region,
+        endpoint_url: @settings.kms_endpoint_url,
+        allow_insecure_endpoint: @settings.allow_insecure_endpoint?,
+        retries: @settings.retries,
+        connect_timeout: @settings.connect_timeout,
+        read_timeout: @settings.read_timeout)
     end
 
     private def process_session_type(parameters : JSON::Any?) : Bool
@@ -466,6 +545,11 @@ module KrikriAwsSsm
     private def send_input(payload_type : UInt32, payload : Bytes) : Nil
       @write_mutex.synchronize do
         raise_closed if closed?
+        if @encryption_enabled && payload_type == PayloadType::Output.value
+          if encrypter = @encrypter
+            payload = encrypter.encrypt(payload)
+          end
+        end
         sequence = @reliability.allocate
         frame = Message.new(
           message_type: MessageType::INPUT_STREAM_DATA,

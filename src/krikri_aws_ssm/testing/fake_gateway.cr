@@ -1,3 +1,4 @@
+require "base64"
 require "http/server"
 require "http/web_socket"
 require "json"
@@ -18,6 +19,8 @@ module KrikriAwsSsm::Testing
     property agent_options : FakeAgent::Options
     property? presigned : Bool
     property credentials : Credentials
+    property kms_plaintext_key : Bytes
+    property kms_ciphertext_blob : Bytes
 
     getter control_requests = Channel(HTTP::Request).new(32)
     getter upgrade_requests = Channel(HTTP::Request).new(8)
@@ -26,6 +29,7 @@ module KrikriAwsSsm::Testing
     getter agents = Channel(FakeAgent).new(8)
     getter resumed_sessions = Channel(String).new(8)
     getter terminated_sessions = Channel(String).new(8)
+    getter kms_requests = Channel(HTTP::Request).new(16)
 
     @server : HTTP::Server
     @token_sequence = 0
@@ -35,6 +39,8 @@ module KrikriAwsSsm::Testing
     def initialize(@credentials : Credentials,
                    @agent_options : FakeAgent::Options = FakeAgent::Options.new,
                    @presigned : Bool = false)
+      @kms_plaintext_key = @agent_options.kms_plaintext_key
+      @kms_ciphertext_blob = Bytes[9_u8, 8_u8, 7_u8, 6_u8]
       @server = HTTP::Server.new do |context|
         if upgrade?(context.request)
           handle_upgrade(context)
@@ -69,15 +75,22 @@ module KrikriAwsSsm::Testing
       captured = HTTP::Request.new(request.method, request.resource, request.headers, body)
       @control_requests.send(captured)
 
+      action = request.headers["X-Amz-Target"]?.try(&.split('.').last) || ""
+      service = request.headers["X-Amz-Target"]?.try(&.starts_with?("TrentService.")) ? "kms" : "ssm"
+
       begin
-        SigV4.verify(captured, @credentials, "us-east-1", "ssm")
+        SigV4.verify(captured, @credentials, "us-east-1", service)
       rescue ex : SigV4::VerificationError
         respond(context, 400,
           %({"__type":"SignatureDoesNotMatch","message":#{ex.message.to_json}}))
         return
       end
 
-      action = request.headers["X-Amz-Target"]?.try(&.split('.').last) || ""
+      if service == "kms"
+        handle_kms(context, action, body)
+        return
+      end
+
       case action
       when "StartSession"
         respond(context, 200, session_payload)
@@ -93,6 +106,24 @@ module KrikriAwsSsm::Testing
         respond(context, 400,
           %({"__type":"InvalidAction","message":"unsupported action #{action}"}))
       end
+    end
+
+    private def handle_kms(context : HTTP::Server::Context, action : String, body : String) : Nil
+      request = context.request
+      captured = HTTP::Request.new(request.method, request.resource, request.headers, body)
+      @kms_requests.send(captured)
+      unless action == "GenerateDataKey"
+        respond(context, 400,
+          %({"__type":"InvalidAction","message":"unsupported KMS action #{action}"}))
+        return
+      end
+      respond(context, 200, JSON.build do |json|
+        json.object do
+          json.field "CiphertextBlob", Base64.strict_encode(kms_ciphertext_blob)
+          json.field "KeyId", "arn:aws:kms:us-east-1:123456789012:key/fake"
+          json.field "Plaintext", Base64.strict_encode(kms_plaintext_key)
+        end
+      end)
     end
 
     private def handle_upgrade(context : HTTP::Server::Context) : Nil

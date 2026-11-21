@@ -1,5 +1,7 @@
+require "base64"
 require "http/web_socket"
 require "json"
+require "../encryption"
 require "../handshake"
 require "../message"
 require "../payload"
@@ -16,6 +18,9 @@ module KrikriAwsSsm::Testing
       property agent_version : String = "3.3.3572.0"
       property session_type : String = "Standard_Stream"
       property kms_key_id : String? = nil
+      # The 64-byte data key the fake KMS returns. The agent uses the first
+      # half to encrypt and the last half to decrypt (the client mirrors).
+      property kms_plaintext_key : Bytes = Bytes.new(64) { |index| (index + 1).to_u8 }
       property? handshake : Bool = true
       # First delivery of these inbound sequences is dropped without an ack,
       # which exercises the client's retransmission queue.
@@ -27,6 +32,7 @@ module KrikriAwsSsm::Testing
     getter received_sequences = Channel(Int64).new(1024)
     getter acknowledged_sequences = Channel(Int64).new(1024)
     getter received_input = Channel(Bytes).new(1024)
+    getter challenge_responses = Channel(Bytes).new(4)
     getter pings = Atomic(Int32).new(0)
 
     @options : Options
@@ -38,6 +44,8 @@ module KrikriAwsSsm::Testing
     @stopped = false
     @handshake_sent = false
     @shell_started = false
+    @encrypter : Encrypter?
+    @challenge_plaintext : Bytes?
     @pty : Pty?
     @process : Process?
     @pump_done : Channel(Nil)?
@@ -57,6 +65,11 @@ module KrikriAwsSsm::Testing
     # --- frames the client should handle ----------------------------------
 
     def send_output(bytes : Bytes, payload_type : PayloadType = PayloadType::Output) : Nil
+      if encrypter = @encrypter
+        if [PayloadType::Output.value, PayloadType::StdErr.value, PayloadType::ExitCode.value].includes?(payload_type.value)
+          bytes = encrypter.encrypt(bytes)
+        end
+      end
       send_stream_message(MessageType::OUTPUT_STREAM_DATA, payload_type.value, bytes)
     end
 
@@ -66,6 +79,16 @@ module KrikriAwsSsm::Testing
 
     def send_exit_code(code : Int32) : Nil
       send_output("EXIT_CODE: #{code}", PayloadType::ExitCode)
+    end
+
+    # Encrypt like the real agent, then corrupt the GCM tag, so the client
+    # must reject the payload rather than deliver it.
+    def send_corrupted_output(bytes : Bytes) : Nil
+      encrypter = @encrypter
+      return unless encrypter
+      encrypted = encrypter.encrypt(bytes)
+      encrypted[encrypted.size - 1] = (encrypted[encrypted.size - 1] ^ 0xff).to_u8
+      send_stream_message(MessageType::OUTPUT_STREAM_DATA, PayloadType::Output.value, encrypted)
     end
 
     def send_channel_closed(output : String = "") : Nil
@@ -167,14 +190,29 @@ module KrikriAwsSsm::Testing
       when PayloadType::HandshakeResponse.value
         response = Handshake::HandshakeResponsePayload.from_json(String.new(message.payload))
         @handshake_responses.send(response)
-        send_handshake_complete
-        start_shell
+        if kms_succeeded?(response)
+          @encrypter = mirrored_encrypter
+          send_challenge_request
+        else
+          send_handshake_complete
+          start_shell
+        end
       when PayloadType::Output.value
-        @received_input.send(message.payload.dup)
+        plaintext = decrypted(message.payload)
+        @received_input.send(plaintext)
         @pty.try do |pty|
-          pty.master.write(message.payload)
+          pty.master.write(plaintext)
           pty.master.flush
         end
+      when PayloadType::EncChallengeResponse.value
+        challenge = JSON.parse(String.new(message.payload))["Challenge"]?.try(&.as_s?) || ""
+        if encrypter = @encrypter
+          plaintext = encrypter.decrypt(Base64.decode(challenge))
+          @challenge_plaintext = plaintext
+          @challenge_responses.send(plaintext)
+        end
+        send_handshake_complete
+        start_shell
       when PayloadType::Flag.value
         flag = IO::ByteFormat::BigEndian.decode(UInt32, message.payload)
         if flag == 2 # TerminateSession
@@ -184,8 +222,40 @@ module KrikriAwsSsm::Testing
       when PayloadType::Size.value
         # Terminal size is accepted and ignored unless a spec inspects it.
       else
-        # EncChallengeResponse and unknown payloads are ignored (phase 5).
+        # Unknown payloads are ignored.
       end
+    end
+
+    private def kms_succeeded?(response : Handshake::HandshakeResponsePayload) : Bool
+      response.processed_client_actions.any? do |action|
+        action.action_type == ActionType::KMS_ENCRYPTION &&
+          action.action_status == ActionStatus::Success.value &&
+          action.action_result.try(&.["KMSCipherTextKey"]?).try(&.as_s?)
+      end
+    end
+
+    private def mirrored_encrypter : Encrypter
+      key = @options.kms_plaintext_key
+      Encrypter.new(key[32, 32] + key[0, 32])
+    end
+
+    private def decrypted(payload : Bytes) : Bytes
+      if encrypter = @encrypter
+        encrypter.decrypt(payload)
+      else
+        payload
+      end
+    end
+
+    private def send_challenge_request : Nil
+      encrypter = @encrypter
+      return unless encrypter
+      challenge = Bytes[99_u8, 104_u8, 97_u8, 108_u8, 108_u8, 101_u8, 110_u8, 103_u8, 101_u8]
+      payload = JSON.build do |json|
+        json.object { json.field "Challenge", Base64.strict_encode(encrypter.encrypt(challenge)) }
+      end
+      send_stream_message(MessageType::OUTPUT_STREAM_DATA,
+        PayloadType::EncChallengeRequest.value, payload.to_slice)
     end
 
     # --- outbound ---------------------------------------------------------

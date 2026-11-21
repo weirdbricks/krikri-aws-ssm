@@ -25,13 +25,6 @@ module KrikriAwsSsm
   class HandshakeFailed < Error
   end
 
-  # The agent asked for KMS encryption, which this client cannot provide.
-  class KmsUnsupported < HandshakeFailed
-    def initialize(message = "KMS session encryption is not supported by this client")
-      super(message)
-    end
-  end
-
   # The session is gone: closed by the agent, the network, or the user.
   class ChannelClosed < Error
   end

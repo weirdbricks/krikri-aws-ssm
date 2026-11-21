@@ -12,9 +12,11 @@ module SessionSpecData
   def self.settings(gateway : KrikriAwsSsm::Testing::FakeGateway,
                     connect_timeout : Time::Span = 5.seconds,
                     idle_timeout : Time::Span = 5.seconds,
-                    ping_interval : Time::Span = 30.seconds) : KrikriAwsSsm::Settings
+                    ping_interval : Time::Span = 30.seconds,
+                    kms_endpoint_url : String? = nil) : KrikriAwsSsm::Settings
     KrikriAwsSsm::Settings.new("i-0123456789",
-      endpoint_url: gateway.url, allow_insecure_endpoint: true,
+      endpoint_url: gateway.url, kms_endpoint_url: kms_endpoint_url,
+      allow_insecure_endpoint: true,
       credentials: CREDS, connect_timeout: connect_timeout,
       idle_timeout: idle_timeout, ping_interval: ping_interval)
   end
@@ -256,25 +258,6 @@ describe KrikriAwsSsm::Session do
     end
   end
 
-  it "refuses a KMS encryption request instead of downgrading to plaintext" do
-    options = SessionSpecData.quiet_agent_options
-    options.kms_key_id = "key-1"
-    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS, options)
-    begin
-      error = assert_raises(KrikriAwsSsm::KmsUnsupported) do
-        KrikriAwsSsm::Session.open(SessionSpecData.settings(gateway))
-      end
-      assert_match(/KMS session encryption is not supported/, error.message.to_s)
-
-      agent = receive_with_timeout(gateway.agents)
-      response = receive_with_timeout(agent.handshake_responses)
-      assert_equal 2, response.processed_client_actions.last.action_status
-      assert_equal true, response.errors.try(&.any?(&.includes?("not supported")))
-    ensure
-      gateway.close
-    end
-  end
-
   it "terminates on the control plane and closes the channel idempotently" do
     gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
     gateway.agent_options = SessionSpecData.quiet_agent_options
@@ -360,6 +343,123 @@ describe KrikriAwsSsm::Session do
         open_message = receive_with_timeout(second_agent.open_messages)
         assert_equal "fake-token-2", open_message["TokenValue"].as_s
         refute session.closed?
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+end
+
+describe "KrikriAwsSsm::Session KMS encryption" do
+  it "negotiates KMS, mirrors the challenge and encrypts both directions" do
+    options = SessionSpecData.quiet_agent_options
+    options.kms_key_id = "key-1"
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS, options)
+    begin
+      session = KrikriAwsSsm::Session.open(
+        SessionSpecData.settings(gateway, kms_endpoint_url: gateway.url))
+      begin
+        agent = receive_with_timeout(gateway.agents)
+        response = receive_with_timeout(agent.handshake_responses)
+        kms_action = response.processed_client_actions.find do |action|
+          action.action_type == KrikriAwsSsm::ActionType::KMS_ENCRYPTION
+        end
+        refute_nil kms_action
+        kms_action = kms_action.as(KrikriAwsSsm::Handshake::ProcessedClientAction)
+        assert_equal KrikriAwsSsm::ActionStatus::Success.value, kms_action.action_status
+        result = kms_action.action_result
+        refute_nil result
+        result = result.as(JSON::Any)
+        assert_equal Base64.strict_encode(gateway.kms_ciphertext_blob),
+          result["KMSCipherTextKey"].as_s
+        assert result["KMSCipherTextHash"].raw.nil?
+        assert_equal(
+          %({"KMSCipherTextKey":"#{Base64.strict_encode(gateway.kms_ciphertext_blob)}",) +
+          %("KMSCipherTextHash":null}),
+          result.to_json)
+        assert session.encryption_enabled?
+
+        challenge = receive_with_timeout(agent.challenge_responses)
+        assert_equal "challenge", String.new(challenge)
+
+        session.write("hello\n")
+        assert_equal "hello\n", String.new(receive_with_timeout(agent.received_input))
+
+        agent.send_output("out\n")
+        assert_equal "out\n", String.new(read_required(session).bytes)
+        agent.send_output("err\n", KrikriAwsSsm::PayloadType::StdErr)
+        stderr = read_required(session)
+        assert_equal KrikriAwsSsm::Stream::Stderr, stderr.stream
+        assert_equal "err\n", String.new(stderr.bytes)
+
+        agent.send_exit_code(7)
+        agent.send_channel_closed("bye")
+        assert_nil read_with_timeout(session)
+        assert_equal 7, session.exit_code
+
+        kms_request = receive_with_timeout(gateway.kms_requests)
+        body = JSON.parse(kms_request.body || "")
+        assert_equal 64, body["NumberOfBytes"].as_i
+        assert_equal "s-fake-1", body["EncryptionContext"]["aws:ssm:SessionId"].as_s
+        assert_equal "i-0123456789", body["EncryptionContext"]["aws:ssm:TargetId"].as_s
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
+  it "fails the handshake when KMS denies GenerateDataKey instead of downgrading" do
+    options = SessionSpecData.quiet_agent_options
+    options.kms_key_id = "key-1"
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS, options)
+    kms_server = TestHttpServer.new do |_request|
+      TestHttpResponse.new(403,
+        %({"__type":"AccessDeniedException","message":"no kms:GenerateDataKey"}))
+    end
+    begin
+      error = assert_raises(KrikriAwsSsm::HandshakeFailed) do
+        KrikriAwsSsm::Session.open(
+          SessionSpecData.settings(gateway, kms_endpoint_url: kms_server.url))
+      end
+      assert_includes error.message.to_s, "Failed to process action KMSEncryption"
+      assert_includes error.message.to_s, "no kms:GenerateDataKey"
+
+      agent = receive_with_timeout(gateway.agents)
+      response = receive_with_timeout(agent.handshake_responses)
+      kms_action = response.processed_client_actions.find do |action|
+        action.action_type == KrikriAwsSsm::ActionType::KMS_ENCRYPTION
+      end
+      refute_nil kms_action
+      assert_equal KrikriAwsSsm::ActionStatus::Failed.value,
+        kms_action.as(KrikriAwsSsm::Handshake::ProcessedClientAction).action_status
+      refute_nil response.errors
+    ensure
+      kms_server.close
+      gateway.close
+    end
+  end
+
+  it "closes with ProtocolError when an encrypted payload fails authentication" do
+    options = SessionSpecData.quiet_agent_options
+    options.kms_key_id = "key-1"
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS, options)
+    begin
+      session = KrikriAwsSsm::Session.open(
+        SessionSpecData.settings(gateway, kms_endpoint_url: gateway.url))
+      begin
+        agent = receive_with_timeout(gateway.agents)
+        receive_with_timeout(agent.handshake_responses)
+        receive_with_timeout(agent.challenge_responses)
+
+        agent.send_corrupted_output("should not be delivered".to_slice)
+
+        assert wait_until(3.seconds) { session.closed? }
+        assert_equal KrikriAwsSsm::CloseReason::ProtocolError, session.close_reason
+        assert session.error.is_a?(KrikriAwsSsm::ProtocolError)
       ensure
         session.terminate
       end

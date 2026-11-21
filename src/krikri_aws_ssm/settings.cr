@@ -17,6 +17,8 @@ module KrikriAwsSsm
     property profile : String?
     # Overrides the SSM control-plane endpoint (tests, VPC endpoints).
     property endpoint_url : String?
+    # Overrides the KMS endpoint (tests, VPC endpoints). nil follows the region.
+    property kms_endpoint_url : String?
     # Allow `ws://`/`http://` endpoints. Only for an explicit test endpoint;
     # production endpoints must be TLS.
     property? allow_insecure_endpoint : Bool
@@ -34,6 +36,7 @@ module KrikriAwsSsm
 
     def initialize(@target : String, @region : String = DEFAULT_REGION,
                    @profile : String? = nil, @endpoint_url : String? = nil,
+                   @kms_endpoint_url : String? = nil,
                    @allow_insecure_endpoint : Bool = false, @document : String? = nil,
                    @parameters : Hash(String, Array(String)) = {} of String => Array(String),
                    @connect_timeout : Time::Span = DEFAULT_TIMEOUT,
