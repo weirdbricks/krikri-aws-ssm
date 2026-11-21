@@ -17,6 +17,7 @@ require "./krikri_aws_ssm/client"
 require "./krikri_aws_ssm/stream_url"
 require "./krikri_aws_ssm/chunker"
 require "./krikri_aws_ssm/reliability"
+require "./krikri_aws_ssm/handshake"
 
 module KrikriAwsSsm
   VERSION = {{ `shards version "#{__DIR__}"`.chomp.stringify }}
