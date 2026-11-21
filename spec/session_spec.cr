@@ -42,6 +42,23 @@ describe KrikriAwsSsm::Session do
     end
   end
 
+  it "waits for an upgrade result with a timeout" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    begin
+      session = KrikriAwsSsm::Session.open(SessionSpecData.settings(gateway))
+      begin
+        result = gateway.next_upgrade_result
+        assert_equal ["host", "x-amz-date", "x-amz-security-token"], result.try(&.signed_headers)
+        assert_nil gateway.next_upgrade_result(50.milliseconds)
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
   it "completes the handshake and separates stdout, stderr, exit code and channel_closed" do
     gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
     gateway.agent_options = SessionSpecData.quiet_agent_options

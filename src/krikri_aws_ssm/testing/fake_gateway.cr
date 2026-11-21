@@ -35,6 +35,21 @@ module KrikriAwsSsm::Testing
     getter terminated_sessions = Channel(String).new(8)
     getter kms_requests = Channel(HTTP::Request).new(16)
 
+    # Waits for the next websocket upgrade's verified signed-header set.
+    #
+    # Do not poll `upgrade_results` with `empty?`: a Channel is an Iterator
+    # here, so `empty?` is Enumerable#empty? - it consumes one result and
+    # then blocks forever on the now empty channel. This helper is the
+    # non-destructive wait, returning nil after *timeout*.
+    def next_upgrade_result(timeout : Time::Span = 3.seconds) : SigV4::Result?
+      select
+      when result = upgrade_results.receive
+        result
+      when timeout(timeout)
+        nil
+      end
+    end
+
     @server : HTTP::Server
     @token_sequence = 0
     @connection_sequence = 0
