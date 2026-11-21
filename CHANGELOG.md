@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (in development)
+## 0.2.0 (2026-11-21)
 
 - Phase 5: KMS session encryption. `Kms` calls `GenerateDataKey` (64 bytes,
   encryption context `aws:ssm:SessionId`/`aws:ssm:TargetId`), the handshake
@@ -15,12 +15,17 @@
 - Phase 7: real-account validation harness (`terraform/`) and an opt-in live
   suite covering command execution, KMS-encrypted sessions, a 1 MiB round trip
   and `TerminateSession` cleanup, plus a real `AssumeRole` profile.
-- Still planned: the krikri transport integration (phase 8).
 - Fake harness for downstream (krikri) integration tests: the
   `require "krikri-aws-ssm/testing"` entrypoint now exists, the agent's pty
-  shell accepts extra environment through `FakeAgent::Options#shell_env`, and
+  shell accepts extra environment through `FakeAgent::Options#shell_env`,
   `FakeGateway#control_failure` answers every control-plane action with a
-  chosen status and body so a spec can pin the client's error mapping.
+  chosen status and body so a spec can pin the client's error mapping, and
+  `FakeGateway#next_upgrade_result` gives a timed, non-destructive wait for
+  the verified signed-header set. Observation channels drop samples when
+  nothing drains them instead of blocking the agent's websocket reader, so
+  multi-megabyte transfers complete in-process.
+- The krikri SSM transport (phase 8) and its in-process test matrix live in
+  `krikri-playbook`; this release ships the harness entrypoint they use.
 
 ## 0.1.0
 

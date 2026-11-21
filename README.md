@@ -6,10 +6,11 @@ data-channel protocol itself, so the controller needs **no AWS CLI** and **no
 `session-manager-plugin`** - only the SSM agent on the target and the usual AWS
 permissions.
 
-Status: phases 1-7 complete (wire protocol and session core, fake harness,
-control plane, KMS encryption, credential chain, live validation). The krikri
-transport integration is phase 8. See `docs/protocol.md` for the wire format
-and the design notes it is built from.
+Status: phases 1-8 complete (wire protocol and session core, fake harness,
+control plane, KMS encryption, credential chain, live validation, and the
+krikri SSM transport). The remaining krikri wiring and its test matrix
+(phases 9-10) live in krikri-playbook. See `docs/protocol.md` for the wire
+format and the design notes it is built from.
 
 ## What it does
 
@@ -83,7 +84,9 @@ Downstream tests drive sessions in-process through the fake gateway/agent
 harness: `require "krikri-aws-ssm/testing"`. `FakeAgent::Options#shell_env`
 merges extra variables into the agent's pty shell (a stub `sudo`, a PATH), and
 `FakeGateway#control_failure` answers every SSM control-plane action with a
-given status and body.
+given status and body. The gateway's getters are `Channel`s, which are Iterators
+here: never poll them with `empty?` (it consumes a value and blocks on an empty
+channel); use `FakeGateway#next_upgrade_result` or a `select`.
 
 Development deps mirror krikri: `ameba` 1.7.0 and the
 `weirdbricks/minitest.cr` fork (`v1.7.0-weirdbricks.2`).
