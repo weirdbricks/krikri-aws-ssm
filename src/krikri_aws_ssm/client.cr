@@ -41,8 +41,13 @@ module KrikriAwsSsm
     end
 
     # Resolved credentials, reused for the data-channel SigV4 signature.
+    # Re-resolved near expiry so resume/terminate/KMS on a long session do
+    # not sign with stale temporary credentials; explicit static credentials
+    # from Settings are never refreshed.
     def credentials : Credentials
-      @credentials ||= @chain.resolve(@settings.profile)
+      current = @credentials ||= @chain.resolve(@settings.profile)
+      return current if @settings.credentials
+      @credentials = @chain.refresh(current)
     end
 
     def start_session : SessionInfo
