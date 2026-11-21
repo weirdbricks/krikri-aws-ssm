@@ -1,0 +1,30 @@
+krikri-ssm
+Copyright (c) Krikri Contributors
+
+This product is licensed under the MIT license (see LICENSE).
+
+Not affiliated with, endorsed by, or sponsored by Amazon Web Services, Inc.
+AWS and Amazon Systems Manager are trademarks of Amazon.com, Inc. or its
+affiliates.
+
+## Provenance
+
+AWS publishes the Session Manager control plane (StartSession, ResumeSession,
+TerminateSession, plus StreamUrl/TokenValue) but not a specification for the
+data-channel wire protocol. The protocol implemented here was learned from the
+following open-source sources, and this project is a derivative of what they
+document and implement:
+
+- aws/session-manager-plugin (Apache License 2.0) - the reference client;
+  header layout, handshake, acknowledgements/retransmission, KMS handshake.
+- aws/amazon-ssm-agent (Apache License 2.0) - the protocol peer.
+- hupe1980/aws-ssm-bridge (MIT) - the published "Wire protocol" notes that
+  document the format by observation, including the MessageId byte order and
+  the base64 `[]byte` handshake encoding.
+- dacort/pyssm-client (Apache License 2.0) - an independent Python client,
+  including base64-in-band file transfer.
+
+This project makes no clean-room claim. Per-file provenance notes are added
+when logic is transliterated rather than re-derived; if any Apache-2.0 source
+is transliterated, the Apache License 2.0 text is included alongside this
+NOTICE, as that license requires.

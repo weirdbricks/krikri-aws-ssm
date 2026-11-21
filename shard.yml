@@ -1,0 +1,31 @@
+name: krikri-ssm
+version: 0.1.0
+
+repository: weirdbricks/krikri-ssm
+homepage: https://github.com/weirdbricks/krikri-ssm
+
+description: |
+  Native AWS Systems Manager (SSM) Session Manager client in pure Crystal:
+  StartSession/ResumeSession/TerminateSession, the Session Manager data-channel
+  wire protocol, KMS session encryption, and the standard AWS credential chain.
+  No AWS CLI, no session-manager-plugin.
+
+authors:
+  - Krikri Contributors
+
+crystal: ">= 1.10.0"
+
+license: MIT
+
+dependencies:
+  krikri-aws-signer:
+    github: weirdbricks/krikri-aws-signer
+    tag: v0.3.0
+
+development_dependencies:
+  ameba:
+    github: crystal-ameba/ameba
+    version: 1.7.0
+  minitest:
+    github: weirdbricks/minitest.cr
+    tag: v1.7.0-weirdbricks.2

@@ -1,0 +1,14 @@
+version: 2.0
+shards:
+  ameba:
+    git: https://github.com/crystal-ameba/ameba.git
+    version: 1.7.0
+
+  krikri-aws-signer:
+    git: https://github.com/weirdbricks/krikri-aws-signer.git
+    version: 0.3.0+git.commit.1dab322121cfa43790899fccde91d1651d001e2c
+
+  minitest:
+    git: https://github.com/weirdbricks/minitest.cr.git
+    version: 1.7.0+git.commit.180d963facecb8f5864977caceb3314e4d6ad8cb
+
