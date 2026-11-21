@@ -1,4 +1,4 @@
-# krikri-ssm
+# krikri-aws-ssm
 
 Native AWS Systems Manager (SSM) Session Manager client in pure Crystal, for
 [`krikri-playbook`](https://github.com/weirdbricks/krikri). It speaks the SSM
@@ -44,14 +44,14 @@ transfer and error text live in krikri, not here.
 ## Usage (sketch)
 
 ```crystal
-require "krikri-ssm"
+require "krikri-aws-ssm"
 
-settings = KrikriSSM::Settings.new(
+settings = KrikriAwsSsm::Settings.new(
   target: "i-0123456789abcdef0",
   region: "us-east-2",
 )
 
-session = KrikriSSM::Session.open(settings)
+session = KrikriAwsSsm::Session.open(settings)
 session.write("printf 'hello\\n'\n".to_slice)
 while output = session.read?
   print String.new(output.bytes)

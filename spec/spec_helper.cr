@@ -1,2 +1,2 @@
 require "minitest/autorun"
-require "../src/krikri-ssm"
+require "../src/krikri-aws-ssm"

@@ -6,6 +6,6 @@
 # become wrappers, error text) live in krikri-playbook, not here.
 #
 # See `docs/protocol.md` for the wire format and `NOTICE` for provenance.
-module KrikriSSM
+module KrikriAwsSsm
   VERSION = {{ `shards version "#{__DIR__}"`.chomp.stringify }}
 end

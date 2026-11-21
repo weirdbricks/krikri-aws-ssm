@@ -1,8 +1,8 @@
-name: krikri-ssm
+name: krikri-aws-ssm
 version: 0.1.0
 
-repository: weirdbricks/krikri-ssm
-homepage: https://github.com/weirdbricks/krikri-ssm
+repository: weirdbricks/krikri-aws-ssm
+homepage: https://github.com/weirdbricks/krikri-aws-ssm
 
 description: |
   Native AWS Systems Manager (SSM) Session Manager client in pure Crystal:

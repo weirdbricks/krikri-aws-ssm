@@ -4,7 +4,7 @@ Guidance for AI agents (and humans) working in this repository.
 
 ## What this project is
 
-**krikri-ssm** is a native AWS Systems Manager (SSM) Session Manager client in
+**krikri-aws-ssm** is a native AWS Systems Manager (SSM) Session Manager client in
 pure Crystal. It exists so
 [`krikri-playbook`](https://github.com/weirdbricks/krikri) can run playbooks
 against SSM-only fleets with the equivalent of Ansible's
@@ -72,7 +72,7 @@ explaining why) and the `weirdbricks/minitest.cr` fork, pinned to
 
 - Bump `version` in `shard.yml` and `CHANGELOG.md` per logical change.
 - Tag `vX.Y.Z`, push, then krikri pins the tag in its `shard.yml` and runs
-  `shards update krikri-ssm` (same workflow as `krikri-jinja`).
+  `shards update krikri-aws-ssm` (same workflow as `krikri-jinja`).
 - Live validation is a release gate for protocol changes: run
   `KRIKRI_SSM_LIVE=1 SSM_TARGET=i-... SSM_REGION=... just live` against a real
   target, including an encrypted session when the account mandates it.
