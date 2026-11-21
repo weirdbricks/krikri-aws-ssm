@@ -21,6 +21,12 @@ module KrikriAwsSsm::Testing
       raise IO::Error.from_errno("openpty") unless result == 0
       @master = IO::FileDescriptor.new(master_fd)
       @slave = IO::FileDescriptor.new(slave_fd)
+      # Crystal sets CLOEXEC on the fds it opens, but an openpty fd arrives bare:
+      # the spawned shell used to inherit the MASTER, so closing the pair from the
+      # test never hung the shell up - it waited on its own pty forever, survived
+      # the shard, and held every fd the shard had (the host compile lock included).
+      @master.close_on_exec = true
+      @slave.close_on_exec = true
     end
 
     def close_slave : Nil
