@@ -6,6 +6,11 @@
 # become wrappers, error text) live in krikri-playbook, not here.
 #
 # See `docs/protocol.md` for the wire format and `NOTICE` for provenance.
+require "./krikri_aws_ssm/errors"
+require "./krikri_aws_ssm/payload"
+require "./krikri_aws_ssm/uuid"
+require "./krikri_aws_ssm/message"
+
 module KrikriAwsSsm
   VERSION = {{ `shards version "#{__DIR__}"`.chomp.stringify }}
 end
