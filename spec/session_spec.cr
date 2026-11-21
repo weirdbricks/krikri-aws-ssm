@@ -345,6 +345,41 @@ describe KrikriAwsSsm::Session do
     end
   end
 
+  it "streams input larger than the agent's observation buffers" do
+    options = SessionSpecData.quiet_agent_options
+    options.shell = "/bin/sh"
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS, options)
+    begin
+      session = KrikriAwsSsm::Session.open(SessionSpecData.settings(gateway))
+      begin
+        receive_with_timeout(gateway.agents)
+        line = "a" * 3000
+        lines = 512
+        total = (line.bytesize + 1) * lines
+        session.write("stty -echo 2>/dev/null; head -c #{total} > /dev/null; " \
+                      "printf 'STREAM-%s\\n' DONE\n")
+        spawn do
+          lines.times { session.write(line + "\n") }
+        rescue
+        end
+
+        output = ""
+        deadline = Time.monotonic + 30.seconds
+        while Time.monotonic < deadline
+          chunk = read_with_timeout(session, deadline - Time.monotonic).try(&.bytes)
+          break unless chunk
+          output += String.new(chunk)
+          break if output.includes?("STREAM-DONE")
+        end
+        assert_includes output, "STREAM-DONE"
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
   it "skips SigV4 signing for a presigned StreamUrl" do
     gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS,
       presigned: true)

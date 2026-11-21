@@ -160,9 +160,19 @@ module KrikriAwsSsm::Testing
       send_channel_closed(ex.message.to_s)
     end
 
+    # The observation channels exist for specs, not for the protocol. A
+    # transfer that nobody is watching must never stall the websocket
+    # reader, so a full buffer drops the sample instead of blocking.
+    private def observe(channel : Channel(T), value : T) : Nil forall T
+      select
+      when channel.send(value)
+      else
+      end
+    end
+
     private def handle_input_stream(message : Message) : Nil
       sequence = message.sequence_number
-      @received_sequences.send(sequence)
+      observe(@received_sequences, sequence)
       return unless first_delivery?(sequence)
 
       acceptance = @inbound.accept(sequence, message)
@@ -203,7 +213,7 @@ module KrikriAwsSsm::Testing
         end
       when PayloadType::Output.value
         plaintext = decrypted(message.payload)
-        @received_input.send(plaintext)
+        observe(@received_input, plaintext)
         @pty.try do |pty|
           pty.master.write(plaintext)
           pty.master.flush
