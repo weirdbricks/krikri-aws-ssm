@@ -667,12 +667,14 @@ module KrikriAwsSsm
     # Wait for the send window: the reference plugin silently drops the oldest
     # unacknowledged message when its buffer fills, which abandons a sequence
     # the agent is still waiting for and stalls the stream. Waiting keeps the
-    # in-order stream intact; the liveness loop closes a session whose
+    # in-order stream intact and, with a window sized to the agent's receive
+    # path (Settings#send_window_bytes), stops a burst from overrunning the
+    # service and being dropped. The liveness loop closes a session whose
     # acknowledgements stop, and `wake` releases this wait on close.
     private def await_send_room : Nil
       loop do
         raise_closed if closed?
-        return if @reliability.pending < @settings.send_window
+        return if @reliability.pending_bytes < @settings.send_window_bytes
         @reliability.await_room
       end
     end

@@ -137,24 +137,43 @@ send window above and never by blocking this reader.
 ## Throughput
 
 The data channel is TCP/TLS, so the client's send path decides how fast a bulk
-upload leaves the controller.
+upload leaves the controller. The limiting mechanism is not TCP flow control
+but the agent's input path: a burst larger than it can absorb is dropped by
+the service, and because only the queue head is retransmitted, recovery costs
+one round trip per lost message.
 
-- `TCP_NODELAY` is set on the data-channel socket. A websocket frame is
-  several small writes (frame header, mask key, masked payload) and the
-  payload is usually below one MSS. Go's `net` package, and therefore the
-  reference plugin, disables Nagle by default; Crystal's `TCPSocket` does not.
-  The leading explanation for issue #1692 (a 1 MiB burst at ~1.4 MiB/s, then
-  a sustained ~30 KiB/s, about one MSS per delayed-ACK round trip) is Nagle
-  plus delayed ACK on a below-MSS stream. The live throughput test pins the
-  outcome; `Settings#tcp_nodelay` allows an A/B run.
-- Write coalescing is not the lever on the real path: `OpenSSL::SSL::Socket`
-  is already buffered and the websocket protocol flushes at the end of every
-  frame, so a `wss` frame reaches `SSL_write` as one write. Plain `ws://`
-  (the test endpoint) is unbuffered.
-- Throughput is not improved by larger chunks: `aws-ssm-bridge`'s published
-  wire notes report 8 KiB and 32 KiB chunks accepted by a live agent
-  (3.3.3572.0) and performing identically. The 1024-byte default is kept for
-  interoperability and is configurable through `Settings#chunk_size`.
+Measured on a live t3a.micro (Amazon Linux 2023, agent 3.3.5828.0,
+KMS-encrypted session, ~60ms RTT), uploading the base64 of a 4 MiB payload
+(5.59 MB, 5,593 messages):
+
+| In-flight send window | Wall time | Effective rate | Retransmissions |
+|---|---:|---:|---:|
+| 10,000 messages / 16 MB (reference buffer depth) | 199.1 s | 27 KiB/s | 1,816 |
+| 256 messages (~280 KB) | 27.4 s | 204 KiB/s | 257 |
+| 128 messages (~140 KB) | 11.4 s | 490 KiB/s | 97 |
+| 64 KiB (`Settings#send_window_bytes` default) | 5.8 s | 939 KiB/s | 0 |
+| 48 messages (~53 KB) | 7.2 s | 776 KiB/s | 1 |
+
+With the big window the first ~3.8 MB is accepted at ~1,300 messages/s, then
+the service starts dropping and the remaining backlog drains at ~10 messages/s
+(one per retransmit scan) - the ~30 KiB/s collapse from issue #1692. A window
+of 64 KiB of encoded frames keeps every message inside the agent's receive
+path and sustains ~0.9 MiB/s; the send-window default is therefore
+`Settings#send_window_bytes = 64 KiB`, not the reference plugin's
+`OutgoingMessageBufferCapacity`.
+
+- `TCP_NODELAY` is still set (Go's `net` package, and therefore the reference
+  plugin, disables Nagle by default; Crystal's `TCPSocket` does not). Measured
+  at a 64 KiB window, on/off made no difference (5.5 s vs 5.9 s); it is not the
+  throughput fix, but it is the correct setting for a websocket client.
+  `Settings#tcp_nodelay` allows an A/B run.
+- Write coalescing is not a lever: `OpenSSL::SSL::Socket` is already buffered
+  and the websocket protocol flushes at the end of every frame, so a `wss`
+  frame reaches `SSL_write` as one write.
+- Larger chunks do not help: `aws-ssm-bridge`'s published wire notes report
+  8 KiB and 32 KiB chunks accepted by a live agent (3.3.3572.0) and performing
+  identically. The 1024-byte default is kept for interoperability and is
+  configurable through `Settings#chunk_size`.
 - Unread output never blocks the websocket reader. A bounded queue stopped
   acknowledgement processing whenever output was not drained (and deadlocked
   an upload whose writer waited for acks). Output is buffered in a growable
@@ -226,10 +245,9 @@ Pinned by phase 1-4 specs:
 - Ack `Flags = SYN | FIN`, sequence 0, and the payload JSON shape.
 - Timer defaults from `src/config/config.go`.
 - `Size` (payload 3): acknowledged and ignored (decision above).
-- Send window waits for acks at the reference 10,000-message capacity, the
-  ack-stall close, Karn's algorithm for RTT samples (a labeled divergence),
-  `TCP_NODELAY` (issue #1692), and a growable output queue that never blocks
-  the reader.
+- Send window of 64 KiB in flight (measured; issue #1692), the ack-stall
+  close, Karn's algorithm for RTT samples (a labeled divergence),
+  `TCP_NODELAY`, and a growable output queue that never blocks the reader.
 - Handshake request/response/complete JSON shapes, including `ActionResult:
   null`, `Errors: null`, numeric `ActionStatus`, and nanosecond
   `HandshakeTimeToComplete`.

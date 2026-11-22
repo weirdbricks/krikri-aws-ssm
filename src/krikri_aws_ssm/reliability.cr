@@ -17,10 +17,9 @@ module KrikriAwsSsm
     RTT_ALPHA            = 0.125
     RTT_BETA             =  0.25
     DEFAULT_MAX_ATTEMPTS = 3_000
-    # Reference plugin: config.go's OutgoingMessageBufferCapacity. This is the
-    # send window: a writer waits for an acknowledgement when this many
-    # messages are unacknowledged instead of abandoning the oldest one (see
-    # docs/protocol.md).
+    # Reference plugin: config.go's OutgoingMessageBufferCapacity. The plugin
+    # evicts the oldest unacknowledged message at this depth; this shard keeps
+    # every message (the send window in `Settings` bounds the queue instead).
     OUTGOING_BUFFER_CAPACITY = 10_000
     # Round-trip samples kept for the transfer statistics. Older samples are
     # overwritten; percentiles describe the most recent window, not the whole
@@ -44,7 +43,9 @@ module KrikriAwsSsm
       getter bytes_acked : Int64
       getter retransmissions : Int64
       getter pending : Int32
+      getter pending_bytes : Int64
       getter peak_pending : Int32
+      getter ack_idle : Time::Span
       getter ack_samples : Int32
       getter ack_min : Time::Span?
       getter ack_median : Time::Span?
@@ -52,8 +53,8 @@ module KrikriAwsSsm
       getter ack_max : Time::Span?
 
       def initialize(@elapsed, @messages_sent, @bytes_sent, @acks, @bytes_acked,
-                     @retransmissions, @pending, @peak_pending, @ack_samples,
-                     @ack_min, @ack_median, @ack_p95, @ack_max)
+                     @retransmissions, @pending, @pending_bytes, @peak_pending, @ack_idle,
+                     @ack_samples, @ack_min, @ack_median, @ack_p95, @ack_max)
       end
 
       # Acknowledgements per second since the channel was created.
@@ -81,6 +82,7 @@ module KrikriAwsSsm
       @started_at = @now.call
       @messages_sent = 0_i64
       @bytes_sent = 0_i64
+      @pending_bytes = 0_i64
       @acks = 0_i64
       @bytes_acked = 0_i64
       @retransmissions = 0_i64
@@ -106,6 +108,7 @@ module KrikriAwsSsm
         # idle for longer than the deadline beforehand.
         @last_ack_at = @now.call if @queue.empty?
         @queue << Pending.new(bytes, sequence, @now.call, 0)
+        @pending_bytes += bytes.size
         @messages_sent += 1
         @bytes_sent += bytes.size
         @peak_pending = @queue.size if @queue.size > @peak_pending
@@ -137,6 +140,7 @@ module KrikriAwsSsm
           @last_ack_at = @now.call
           @acks += 1
           @bytes_acked += pending.bytes.size
+          @pending_bytes -= pending.bytes.size
           true
         else
           false
@@ -168,6 +172,11 @@ module KrikriAwsSsm
 
     def pending : Int32
       @mutex.synchronize { @queue.size }
+    end
+
+    # Encoded bytes still awaiting acknowledgement, the send-window input.
+    def pending_bytes : Int64
+      @mutex.synchronize { @pending_bytes }
     end
 
     # Time since the last acknowledgement. With `pending > 0` this detects an
@@ -215,7 +224,9 @@ module KrikriAwsSsm
           bytes_acked: @bytes_acked,
           retransmissions: @retransmissions,
           pending: @queue.size,
+          pending_bytes: @pending_bytes,
           peak_pending: @peak_pending,
+          ack_idle: @now.call - @last_ack_at,
           ack_samples: sorted.size,
           ack_min: sorted.first?,
           ack_median: percentile(sorted, 0.50),

@@ -25,8 +25,12 @@ module LiveSpecData
     settings = KrikriAwsSsm::Settings.new(target,
       region: region, connect_timeout: 30.seconds, idle_timeout: 120.seconds,
       retries: 2)
-    # SSM_LIVE_NO_NAGLE=1 runs the throughput test without the fix, for an A/B.
+    # A/B knobs for the throughput test: the pre-0.2.2 transport and send
+    # window, so the regression can be reproduced on demand.
     settings.tcp_nodelay = false if ENV["SSM_LIVE_NO_NAGLE"]? == "1"
+    if bytes = ENV["SSM_LIVE_SEND_WINDOW_BYTES"]?.try(&.to_i64?)
+      settings.send_window_bytes = bytes
+    end
     settings
   end
 

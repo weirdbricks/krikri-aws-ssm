@@ -2,30 +2,35 @@
 
 ## 0.2.2 (2026-11-21)
 
-- Address the sustained-upload collapse behind issue #1692, which points at
-  Nagle plus delayed ACK: the data-channel TCP socket now sets `TCP_NODELAY`
-  (Crystal's default is Nagle on; Go, and therefore the reference plugin, has
-  it off). A frame is several writes below one MSS, so without it a large
-  upload ran at about one MSS per round trip (~30 KiB/s). The live throughput
-  test pins the rate, and `Settings#tcp_nodelay` allows an A/B run.
+- Fix the sustained-upload collapse behind issue #1692. Measured on a live
+  agent (3.3.5828.0): a burst at the reference 10,000-message depth overruns
+  the agent's input path, the service drops messages, and the stream drains at
+  ~25 KiB/s because only the queue head is retransmitted (one message per
+  scan). The send window is now 64 KiB of in-flight encoded bytes
+  (`Settings#send_window_bytes`), which keeps every message inside the agent's
+  receive path: a 4 MiB payload in 5.59 MB of base64 went from 199.1 s
+  (27 KiB/s) to 5.8 s (939 KiB/s) on a t3a.micro. `TCP_NODELAY` is also set
+  (Go and the reference plugin do), though measured to make no difference once
+  the window paces the sender; `Settings#tcp_nodelay` allows an A/B run.
 - Replace the bounded output channel with a growable queue: the websocket
   reader never waits for a caller to read output, so acknowledgements keep
   flowing while a bulk upload is in progress. `Settings#output_buffer_limit`
   caps the memory and a new `OutputBufferExceeded` error fails an unread
   session instead of blocking it.
-- The send window now waits for acknowledgements instead of dropping the oldest
+- The send window waits for acknowledgements instead of dropping the oldest
   unacknowledged message at the reference plugin's 10,000-message capacity
   (dropping the head abandons a sequence the agent is still waiting for).
-  `Settings#send_window` sets the window, and an ack-stalled stream closes with
-  `SessionTimeout` after `idle_timeout` instead of blocking a writer for the
-  whole retransmission budget.
+  `Settings#send_window_bytes` sets the window, and an ack-stalled stream
+  closes with `SessionTimeout` after `idle_timeout` instead of blocking a
+  writer for the whole retransmission budget.
 - Pings are serialized with data writes, and `close!` snapshots the connection
   it is tearing down, so a `resume` racing with a drop cannot have its new
   websocket or output queue closed by the old teardown.
 - Add `Session#stats`, a diagnostic snapshot of the outbound channel
-  (messages, bytes, acks/second, pending and peak pending, retransmissions and
-  round-trip percentiles), and an opt-in live test that pins the sustained rate
-  of a multi-megabyte upload and prints those counters.
+  (messages, bytes, acks/second, pending messages and bytes, peak pending,
+  ack idle, retransmissions and round-trip percentiles), and an opt-in live
+  test that pins the sustained rate of a multi-megabyte upload and prints
+  those counters.
 
 ## 0.2.1 (2026-11-21)
 

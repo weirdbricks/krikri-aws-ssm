@@ -524,7 +524,7 @@ describe KrikriAwsSsm::Session do
     gateway.agent_options = SessionSpecData.quiet_agent_options
     begin
       settings = SessionSpecData.settings(gateway)
-      settings.send_window = 2
+      settings.send_window_bytes = 2048
       session = KrikriAwsSsm::Session.open(settings)
       begin
         agent = receive_with_timeout(gateway.agents)
@@ -567,7 +567,7 @@ describe KrikriAwsSsm::Session do
     gateway.agent_options = SessionSpecData.quiet_agent_options
     begin
       settings = SessionSpecData.settings(gateway, idle_timeout: 300.milliseconds)
-      settings.send_window = 1
+      settings.send_window_bytes = 1024
       session = KrikriAwsSsm::Session.open(settings)
       begin
         agent = receive_with_timeout(gateway.agents)

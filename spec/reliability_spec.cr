@@ -94,12 +94,14 @@ describe KrikriAwsSsm::Reliability do
 
     assert_equal 1_i64, reliability.stats.messages_sent
     assert_equal 10_i64, reliability.stats.bytes_sent
+    assert_equal 10_i64, reliability.stats.pending_bytes
     assert_equal 1, reliability.stats.peak_pending
 
     assert reliability.acknowledge(sequence)
     stats = reliability.stats
     assert_equal 1_i64, stats.acks
     assert_equal 10_i64, stats.bytes_acked
+    assert_equal 0_i64, stats.pending_bytes
     assert_equal 1, stats.ack_samples
     assert_equal 25.milliseconds, stats.ack_min
     assert_equal 0, stats.pending
