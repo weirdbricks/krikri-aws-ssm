@@ -68,7 +68,8 @@ module KrikriAwsSsm
       end
 
       private def parse_credentials(body : String) : Credentials?
-        json = JSON.parse(body)
+        json = JSON.parse(body).as_h?
+        return unless json
         access_key = json["AccessKeyId"]?.try(&.as_s?)
         secret_key = json["SecretAccessKey"]?.try(&.as_s?)
         session_token = json["Token"]?.try(&.as_s?)

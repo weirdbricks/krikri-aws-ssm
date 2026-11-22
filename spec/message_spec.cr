@@ -127,6 +127,15 @@ describe KrikriAwsSsm::Message do
     assert_equal "payload length 3 does not match frame size 2", error.message
   end
 
+  it "rejects a payload length above 2^31 as a ProtocolError, not an OverflowError" do
+    frame = KrikriAwsSsm::Message.new(message_type: "input_stream_data", payload: "hi".to_slice).encode
+    frame[116, 4].copy_from(Bytes[0xc0, 0x00, 0x00, 0x00])
+    error = assert_raises(KrikriAwsSsm::ProtocolError) do
+      KrikriAwsSsm::Message.decode(frame)
+    end
+    assert_equal "payload length 3221225472 does not match frame size 2", error.message
+  end
+
   it "rejects a message type longer than 32 bytes" do
     error = assert_raises(KrikriAwsSsm::ProtocolError) do
       KrikriAwsSsm::Message.new(message_type: "x" * 33).encode

@@ -15,18 +15,29 @@ module KrikriAwsSsm
     end
 
     def self.parse(json : JSON::Any, action : String) : SessionInfo
-      session_id = json["SessionId"]?.try(&.as_s?)
-      stream_url = json["StreamUrl"]?.try(&.as_s?)
-      token_value = json["TokenValue"]?.try(&.as_s?)
+      # A 200 body that parses as a non-object (`[]`, `42`) makes
+      # `JSON::Any#[]?` raise a bare `Exception`; require an object so the
+      # failure stays a typed `ProtocolError`.
+      object = json.as_h? ||
+               raise ProtocolError.new("#{action} response was not a JSON object")
+      session_id = object["SessionId"]?.try(&.as_s?)
+      stream_url = object["StreamUrl"]?.try(&.as_s?)
+      token_value = object["TokenValue"]?.try(&.as_s?)
       unless session_id && stream_url && token_value
         raise ProtocolError.new("#{action} response is missing SessionId, StreamUrl or TokenValue")
       end
       new(session_id, stream_url, token_value)
     end
 
-    # Never print the token or URL: both are session secrets.
+    # Never print the token or URL: both are session secrets. `inspect` is
+    # redacted too: `p`/`pp`, exception dumps and debugger output call it, and
+    # the default implementation prints every ivar.
     def to_s(io : IO) : Nil
       io << "SessionInfo(#{@session_id})"
+    end
+
+    def inspect(io : IO) : Nil
+      to_s(io)
     end
   end
 
@@ -38,16 +49,20 @@ module KrikriAwsSsm
     def initialize(@settings : Settings, @chain : CredentialChain = CredentialChain.default,
                    @aws_json : AwsJson? = nil)
       @credentials = @settings.credentials
+      @credentials_mutex = Mutex.new
     end
 
     # Resolved credentials, reused for the data-channel SigV4 signature.
     # Re-resolved near expiry so resume/terminate/KMS on a long session do
     # not sign with stale temporary credentials; explicit static credentials
-    # from Settings are never refreshed.
+    # from Settings are never refreshed. Callers include the dial, terminate
+    # and KMS fibers, so the swap is serialized.
     def credentials : Credentials
-      current = @credentials ||= @chain.resolve(@settings.profile)
-      return current if @settings.credentials
-      @credentials = @chain.refresh(current)
+      @credentials_mutex.synchronize do
+        current = @credentials ||= @chain.resolve(@settings.profile)
+        return current if @settings.credentials
+        @credentials = @chain.refresh(current)
+      end
     end
 
     def start_session : SessionInfo
@@ -70,7 +85,7 @@ module KrikriAwsSsm
 
     def describe_sessions(state : String = "Active") : Array(JSON::Any)
       response = aws_json.call("DescribeSessions", %({"State":#{state.to_json}}))
-      response["Sessions"]?.try(&.as_a?) || [] of JSON::Any
+      response.as_h?.try(&.["Sessions"]?).try(&.as_a?) || [] of JSON::Any
     end
 
     private def aws_json : AwsJson
@@ -78,7 +93,9 @@ module KrikriAwsSsm
         AwsJson.new(
           service: "ssm",
           region: @settings.region,
-          credentials: credentials,
+          # A provider, not a snapshot: a session outliving its temporary
+          # credentials must still be able to resume and terminate.
+          credentials: -> { credentials },
           endpoint_url: @settings.endpoint_url,
           retries: @settings.retries,
           allow_insecure_endpoint: @settings.allow_insecure_endpoint?,

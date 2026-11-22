@@ -28,8 +28,13 @@ module KrikriAwsSsm
     end
 
     # Never reveal the secret key or the full session token in logs.
+    # `inspect` would otherwise print both ivars (`p`, `pp`, exception dumps).
     def to_s(io : IO) : Nil
       io << "Credentials(" << access_key_prefix << "..., token=" << (@session_token ? "yes" : "no") << ')'
+    end
+
+    def inspect(io : IO) : Nil
+      to_s(io)
     end
 
     private def access_key_prefix : String

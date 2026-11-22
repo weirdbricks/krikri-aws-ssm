@@ -38,6 +38,16 @@ describe KrikriAwsSsm::Client do
     end
   end
 
+  it "redacts the token and stream URL from inspect" do
+    info = KrikriAwsSsm::SessionInfo.new("s-1",
+      "wss://ssmmessages.us-east-1.amazonaws.com/v1/data-channel/s-1?X-Amz-Signature=deadbeef",
+      "secret-token")
+    text = info.inspect
+    refute_includes text, "secret-token"
+    refute_includes text, "X-Amz-Signature"
+    assert_includes text, "s-1"
+  end
+
   it "sends DocumentName and Parameters when set" do
     server = TestHttpServer.new do |_request|
       TestHttpResponse.new(200, ClientSpecData::START_RESPONSE)
@@ -137,6 +147,56 @@ describe KrikriAwsSsm::Client do
     end
   end
 
+  it "keeps a non-object error body a typed ApiError" do
+    server = TestHttpServer.new do |_request|
+      TestHttpResponse.new(400, %(["not", "an", "object"]))
+    end
+    begin
+      settings = KrikriAwsSsm::Settings.new("i-0123456789",
+        endpoint_url: server.url, allow_insecure_endpoint: true,
+        credentials: ClientSpecData::CREDS)
+      error = assert_raises(KrikriAwsSsm::ApiError) do
+        KrikriAwsSsm::Client.new(settings).start_session
+      end
+      assert_equal "UnknownError", error.code
+      assert_equal 400, error.status
+      assert_includes error.message.to_s, "not"
+    ensure
+      server.close
+    end
+  end
+
+  it "rejects a non-object success body as a ProtocolError" do
+    server = TestHttpServer.new do |_request|
+      TestHttpResponse.new(200, "[]")
+    end
+    begin
+      settings = KrikriAwsSsm::Settings.new("i-0123456789",
+        endpoint_url: server.url, allow_insecure_endpoint: true,
+        credentials: ClientSpecData::CREDS)
+      error = assert_raises(KrikriAwsSsm::ProtocolError) do
+        KrikriAwsSsm::Client.new(settings).start_session
+      end
+      assert_equal "StartSession response was not a JSON object", error.message
+    ensure
+      server.close
+    end
+  end
+
+  it "returns no sessions from a non-object DescribeSessions body" do
+    server = TestHttpServer.new do |_request|
+      TestHttpResponse.new(200, "42")
+    end
+    begin
+      settings = KrikriAwsSsm::Settings.new("i-0123456789",
+        endpoint_url: server.url, allow_insecure_endpoint: true,
+        credentials: ClientSpecData::CREDS)
+      assert_empty KrikriAwsSsm::Client.new(settings).describe_sessions
+    ensure
+      server.close
+    end
+  end
+
   it "rejects a response missing SessionId, StreamUrl or TokenValue" do
     server = TestHttpServer.new do |_request|
       TestHttpResponse.new(200, %({"SessionId":"s-1"}))
@@ -197,6 +257,33 @@ describe KrikriAwsSsm::Client do
 
     assert_equal 3, attempts
     assert_equal "s-1", info.session_id
+  end
+
+  it "signs a later control-plane call with refreshed credentials" do
+    calls = 0
+    chain = KrikriAwsSsm::CredentialChain.new([
+      ->(_profile : String?) do
+        calls += 1
+        KrikriAwsSsm::Credentials.new("KEY#{calls}", "SECRET#{calls}",
+          expires_at: Time.utc + 1.minute).as(KrikriAwsSsm::Credentials?)
+      end,
+    ])
+    server = TestHttpServer.new do |_request|
+      TestHttpResponse.new(200, ClientSpecData::START_RESPONSE)
+    end
+    begin
+      settings = KrikriAwsSsm::Settings.new("i-0123456789",
+        endpoint_url: server.url, allow_insecure_endpoint: true)
+      client = KrikriAwsSsm::Client.new(settings, chain)
+      client.start_session
+      client.describe_sessions
+
+      first = server.next_request.headers["Authorization"].split("Credential=")[1].split('/').first
+      second = server.next_request.headers["Authorization"].split("Credential=")[1].split('/').first
+      refute_equal first, second
+    ensure
+      server.close
+    end
   end
 
   it "does not retry failures after a request may have been sent" do

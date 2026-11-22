@@ -20,6 +20,14 @@ describe KrikriAwsSsm::CredentialChain do
     refute_includes text, "session-token"
   end
 
+  it "never reveals secrets from Credentials#inspect" do
+    credentials = KrikriAwsSsm::Credentials.new("AKIDEXAMPLE", "super-secret", "session-token")
+    text = credentials.inspect
+    refute_includes text, "super-secret"
+    refute_includes text, "session-token"
+    assert_includes text, "AKID..."
+  end
+
   it "prefers environment credentials over any profile" do
     CredentialSpecHelper.with_temp_dir do |dir|
       CredentialSpecHelper.write(File.join(dir, "credentials"),
@@ -134,6 +142,17 @@ describe KrikriAwsSsm::CredentialChain do
       assert_equal "PROCESSSECRET", credentials.secret_key
       assert_equal "PROCESSTOKEN", credentials.session_token
       refute credentials.expired?
+    end
+  end
+
+  it "rejects a non-object credential_process output with a CredentialsError" do
+    CredentialSpecHelper.with_temp_dir do |dir|
+      command = %(printf '%s' '["nope"]')
+      CredentialSpecHelper.write(File.join(dir, "config"),
+        "[profile proc]\ncredential_process = #{command}\n")
+      chain = CredentialSpecHelper.chain({"AWS_EC2_METADATA_DISABLED" => "true"}, dir)
+      error = assert_raises(KrikriAwsSsm::CredentialsError) { chain.resolve("proc") }
+      assert_includes error.message.to_s, "non-object"
     end
   end
 

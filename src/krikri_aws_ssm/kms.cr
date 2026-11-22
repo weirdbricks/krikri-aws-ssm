@@ -21,9 +21,20 @@ module KrikriAwsSsm
 
       def initialize(@plaintext : Bytes, @ciphertext_blob : Bytes)
       end
+
+      # The plaintext is key material; `inspect` (used by `p`/`pp` and
+      # exception dumps) would otherwise print it as a byte list.
+      def to_s(io : IO) : Nil
+        io << "DataKey(plaintext=" << @plaintext.size << " bytes, ciphertext=" \
+                                                          << @ciphertext_blob.size << " bytes)"
+      end
+
+      def inspect(io : IO) : Nil
+        to_s(io)
+      end
     end
 
-    def initialize(@credentials : Credentials, @region : String,
+    def initialize(@credentials : Credentials | Proc(Credentials), @region : String,
                    endpoint_url : String? = nil, allow_insecure_endpoint : Bool = false,
                    retries : Int32 = 3, connect_timeout : Time::Span = 60.seconds,
                    read_timeout : Time::Span = 60.seconds,
@@ -62,7 +73,9 @@ module KrikriAwsSsm
     end
 
     private def decode_bytes(response : JSON::Any, field : String) : Bytes
-      encoded = response[field]?.try(&.as_s?)
+      # `as_h?` first: a non-object body would make `#[]?` raise a bare
+      # `Exception` instead of the typed `ProtocolError`.
+      encoded = response.as_h?.try(&.[field]?).try(&.as_s?)
       raise ProtocolError.new("KMS response is missing #{field}") unless encoded
       Base64.decode(encoded)
     rescue ex : Base64::Error

@@ -29,6 +29,9 @@ module KrikriAwsSsm::Testing
       # own), so a spec can put a stub `sudo` or a PATH on the "target"
       # without mutating the test process's ENV.
       property shell_env : Hash(String, String)? = nil
+      # Overrides the EncChallengeRequest payload, so a spec can send a
+      # non-object JSON body.
+      property challenge_payload : String? = nil
     end
 
     getter open_messages = Channel(JSON::Any).new(8)
@@ -245,7 +248,7 @@ module KrikriAwsSsm::Testing
           pty.master.flush
         end
       when PayloadType::EncChallengeResponse.value
-        challenge = JSON.parse(String.new(message.payload))["Challenge"]?.try(&.as_s?) || ""
+        challenge = JSON.parse(String.new(message.payload)).as_h?.try(&.["Challenge"]?).try(&.as_s?) || ""
         if encrypter = @encrypter
           plaintext = encrypter.decrypt(Base64.decode(challenge))
           @challenge_plaintext = plaintext
@@ -270,7 +273,7 @@ module KrikriAwsSsm::Testing
       response.processed_client_actions.any? do |action|
         action.action_type == ActionType::KMS_ENCRYPTION &&
           action.action_status == ActionStatus::Success.value &&
-          action.action_result.try(&.["KMSCipherTextKey"]?).try(&.as_s?)
+          action.action_result.try(&.as_h?).try(&.["KMSCipherTextKey"]?).try(&.as_s?)
       end
     end
 
@@ -291,8 +294,11 @@ module KrikriAwsSsm::Testing
       encrypter = @encrypter
       return unless encrypter
       challenge = Bytes[99_u8, 104_u8, 97_u8, 108_u8, 108_u8, 101_u8, 110_u8, 103_u8, 101_u8]
-      payload = JSON.build do |json|
-        json.object { json.field "Challenge", Base64.strict_encode(encrypter.encrypt(challenge)) }
+      payload = @options.challenge_payload
+      unless payload
+        payload = JSON.build do |json|
+          json.object { json.field "Challenge", Base64.strict_encode(encrypter.encrypt(challenge)) }
+        end
       end
       send_stream_message(MessageType::OUTPUT_STREAM_DATA,
         PayloadType::EncChallengeRequest.value, payload.to_slice)

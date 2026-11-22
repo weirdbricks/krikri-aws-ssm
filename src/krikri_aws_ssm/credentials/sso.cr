@@ -65,7 +65,9 @@ module KrikriAwsSsm
             "No SSO token cache entry for profile #{profile_name} (expected #{path}). #{TOKEN_ERROR}")
         end
 
-        json = JSON.parse(File.read(path))
+        json = JSON.parse(File.read(path)).as_h? ||
+               raise CredentialsError.new(
+                 "SSO token cache entry for profile #{profile_name} is not a JSON object. #{TOKEN_ERROR}")
         access_token = json["accessToken"]?.try(&.as_s?)
         expires_at = json["expiresAt"]?.try(&.as_s?)
         unless access_token && expires_at
@@ -101,8 +103,9 @@ module KrikriAwsSsm
       end
 
       private def parse_credentials(body : String) : Credentials
-        json = JSON.parse(body)
-        role = json["roleCredentials"]?
+        json = JSON.parse(body).as_h? ||
+               raise CredentialsError.new("SSO GetRoleCredentials response was not a JSON object")
+        role = json["roleCredentials"]?.try(&.as_h?)
         unless role
           raise CredentialsError.new("SSO GetRoleCredentials response did not contain roleCredentials")
         end

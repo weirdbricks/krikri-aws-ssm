@@ -78,5 +78,16 @@ module KrikriAwsSsm
         raise ConfigurationError.new("output_buffer_limit must be positive")
       end
     end
+
+    # Settings hold credentials and maybe a token-bearing endpoint; the default
+    # `inspect` (used by `p`/`pp` and exception dumps) prints every ivar.
+    def to_s(io : IO) : Nil
+      io << "Settings(target=" << @target << ", region=" << @region
+      io << ", profile=" << (@profile || "-") << ')'
+    end
+
+    def inspect(io : IO) : Nil
+      to_s(io)
+    end
   end
 end

@@ -115,6 +115,25 @@ describe KrikriAwsSsm::CredentialChain::Sso do
     end
   end
 
+  it "rejects a non-object SSO token cache entry with the parity error" do
+    CredentialSpecHelper.with_temp_dir do |dir|
+      start_url = "https://example.awsapps.com/start"
+      CredentialSpecHelper.write(File.join(dir, "config"), <<-INI)
+        [profile sso]
+        sso_start_url = #{start_url}
+        sso_region = us-east-1
+        sso_account_id = 123456789012
+        sso_role_name = MyRole
+        INI
+      CredentialSpecHelper.write(
+        File.join(dir, "sso-cache", "#{Digest::SHA1.hexdigest(start_url)}.json"), %(["nope"]))
+
+      chain = CredentialSpecHelper.chain({"AWS_EC2_METADATA_DISABLED" => "true"}, dir)
+      error = assert_raises(KrikriAwsSsm::CredentialsError) { chain.resolve("sso") }
+      assert_includes error.message.to_s, "not a JSON object"
+    end
+  end
+
   it "names the profile when the SSO token cache entry is missing" do
     CredentialSpecHelper.with_temp_dir do |dir|
       CredentialSpecHelper.write(File.join(dir, "config"), <<-INI)

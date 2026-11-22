@@ -374,7 +374,9 @@ module KrikriAwsSsm
     end
 
     private def parse_process_output(name : String, output : String) : Credentials
-      json = JSON.parse(output)
+      json = JSON.parse(output).as_h? ||
+             raise CredentialsError.new(
+               "credential_process for profile \"#{name}\" returned a non-object JSON document")
       version = json["Version"]?.try(&.as_i?)
       unless version == 1
         raise CredentialsError.new(

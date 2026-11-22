@@ -104,7 +104,10 @@ module KrikriAwsSsm
       payload_type = read_u32(bytes, 112)
       payload_length = read_u32(bytes, 116)
 
-      unless bytes.size == TOTAL_HEADER_LENGTH + payload_length
+      # Widen before adding: `Int32 + UInt32` promotes to `Int32`, so a
+      # hostile `PayloadLength` above 2^31 raises `OverflowError` here instead
+      # of the typed `ProtocolError` this method promises.
+      unless bytes.size.to_i64 == TOTAL_HEADER_LENGTH.to_i64 + payload_length.to_i64
         raise ProtocolError.new(
           "payload length #{payload_length} does not match frame size #{bytes.size - TOTAL_HEADER_LENGTH}")
       end

@@ -19,7 +19,8 @@ module KrikriAwsSsm
 
     @endpoint : URI
 
-    def initialize(@service : String, @region : String, @credentials : Credentials,
+    def initialize(@service : String, @region : String,
+                   @credentials : Credentials | Proc(Credentials),
                    endpoint_url : String? = nil, @target_prefix : String = "AmazonSSM",
                    @retries : Int32 = 3, @allow_insecure_endpoint : Bool = false,
                    @connect_timeout : Time::Span = 60.seconds,
@@ -91,18 +92,30 @@ module KrikriAwsSsm
       rescue JSON::ParseException
         nil
       end
-      code = parsed.try(&.["__type"]?).try(&.as_s?) ||
+      # `JSON::Any#[]?` raises a bare `Exception` on a non-object body (an
+      # array, a scalar, an HTML page that parsed as JSON), which would mask
+      # the real API error and status; `as_h?` keeps the typed surface.
+      object = parsed.try(&.as_h?)
+      code = object.try(&.["__type"]?).try(&.as_s?) ||
              response.headers["x-amzn-errortype"]? ||
              "UnknownError"
-      message = parsed.try(&.["message"]?).try(&.as_s?) ||
-                parsed.try(&.["Message"]?).try(&.as_s?) ||
+      message = object.try(&.["message"]?).try(&.as_s?) ||
+                object.try(&.["Message"]?).try(&.as_s?) ||
                 body
       ApiError.from_code(code, message, response.status_code, response.headers["x-amzn-RequestId"]?)
     end
 
     private def signer : KrikriAwsSigner::Signer
-      KrikriAwsSigner::Signer.new(@service, @region, @credentials.access_key,
-        @credentials.secret_key, @credentials.session_token)
+      # A long-lived client (resume/terminate/KMS) must sign with the current
+      # credentials, not the snapshot taken when it was built.
+      credentials = current_credentials
+      KrikriAwsSigner::Signer.new(@service, @region, credentials.access_key,
+        credentials.secret_key, credentials.session_token)
+    end
+
+    private def current_credentials : Credentials
+      credentials = @credentials
+      credentials.is_a?(Proc(Credentials)) ? credentials.call : credentials
     end
 
     private def resolve_endpoint(endpoint_url : String?) : URI

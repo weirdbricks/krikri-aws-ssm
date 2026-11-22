@@ -94,6 +94,16 @@ module KrikriAwsSsm
       @client_id = UUID.random.to_s
     end
 
+    # The session holds `@info` (stream URL and token) and settings holding
+    # credentials; the default `inspect` prints both.
+    def to_s(io : IO) : Nil
+      io << "Session(" << @session_id << ')'
+    end
+
+    def inspect(io : IO) : Nil
+      to_s(io)
+    end
+
     # True once the KMS handshake action succeeded and payload encryption is on.
     def encryption_enabled? : Bool
       @encryption_enabled
@@ -259,7 +269,9 @@ module KrikriAwsSsm
       host = uri.host
       raise ProtocolError.new("StreamUrl has no host") unless host
       port = uri.port || (uri.scheme == "wss" ? 443 : 80)
-      tcp = TCPSocket.new(host, port)
+      # A black-holed gateway must not park connect/resume forever: the
+      # liveness fibers only start after the upgrade completes.
+      tcp = TCPSocket.new(host, port, connect_timeout: @settings.connect_timeout)
       begin
         # A websocket frame is several small writes and the payload is usually
         # below one MSS. With Nagle on (Crystal's default, unlike Go's) every
@@ -268,6 +280,11 @@ module KrikriAwsSsm
         # typical link). Go's net package, and therefore the reference plugin,
         # disables Nagle by default. See docs/protocol.md.
         tcp.tcp_nodelay = @settings.tcp_nodelay?
+        # Bound the TLS/client handshake and the upgrade read; the established
+        # channel is long-lived and frame pacing is handled by the ping/idle
+        # loops, so the timeout is cleared before the socket is returned.
+        # Set on the TCP socket: the TLS socket delegates its reads to it.
+        tcp.read_timeout = @settings.read_timeout
         io = if uri.scheme == "wss"
                context = OpenSSL::SSL::Context::Client.new
                OpenSSL::SSL::Socket::Client.new(tcp, context: context, sync_close: true,
@@ -279,9 +296,12 @@ module KrikriAwsSsm
         headers = HTTP::Headers{"Host" => StreamUrl.authority(uri)}
         request = HTTP::Request.new("GET", StreamUrl.request_target(uri), headers)
         unless StreamUrl.presigned?(uri)
+          # One resolution: each call may refresh, and a refresh between two
+          # calls would mix key material from two credential sets in one
+          # signature.
+          creds = @client.credentials
           signer = KrikriAwsSigner::Signer.new("ssmmessages", @settings.region,
-            @client.credentials.access_key, @client.credentials.secret_key,
-            @client.credentials.session_token)
+            creds.access_key, creds.secret_key, creds.session_token)
           signer.sign(request, add_sha: false)
         end
 
@@ -291,9 +311,12 @@ module KrikriAwsSsm
         request.headers["Sec-WebSocket-Version"] = "13"
         request.headers["Sec-WebSocket-Key"] = key
 
+        # The established channel is long-lived and frame pacing comes from
+        # the ping/idle loops, so the handshake timeout is cleared here.
         request.to_io(io)
         io.flush
         response = HTTP::Client::Response.from_io(io, ignore_body: true)
+        tcp.read_timeout = nil
         unless response.status.switching_protocols?
           quietly { tcp.close }
           raise HandshakeFailed.new(
@@ -485,7 +508,11 @@ module KrikriAwsSsm
         close!(CloseReason::ProtocolError)
         return
       end
-      challenge = JSON.parse(String.new(message.payload))["Challenge"]?.try(&.as_s?)
+      # `JSON::Any#[]?` raises a bare `Exception` on a non-object payload,
+      # which none of this method's rescues catch; a ProtocolError keeps the
+      # failure typed and the close reason accurate.
+      object = JSON.parse(String.new(message.payload)).as_h?
+      challenge = object.try(&.["Challenge"]?).try(&.as_s?)
       raise ProtocolError.new("EncChallengeRequest is missing Challenge") unless challenge
       plaintext = encrypter.decrypt(Base64.decode(challenge))
       encrypted = encrypter.encrypt(plaintext)
@@ -606,7 +633,9 @@ module KrikriAwsSsm
     end
 
     private def kms_client : Kms
-      @kms ||= Kms.new(@client.credentials, @settings.region,
+      # The provider keeps KMS signing with refreshed credentials on a long
+      # session instead of the snapshot taken at handshake time.
+      @kms ||= Kms.new(-> { @client.credentials }, @settings.region,
         endpoint_url: @settings.kms_endpoint_url,
         allow_insecure_endpoint: @settings.allow_insecure_endpoint?,
         retries: @settings.retries,

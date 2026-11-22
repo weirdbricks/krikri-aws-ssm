@@ -62,7 +62,8 @@ module KrikriAwsSsm
           token_headers(endpoint, token))
         return unless response.success?
 
-        json = JSON.parse(response.body)
+        json = JSON.parse(response.body).as_h?
+        return unless json
         access_key = json["AccessKeyId"]?.try(&.as_s?)
         secret_key = json["SecretAccessKey"]?.try(&.as_s?)
         session_token = json["Token"]?.try(&.as_s?)

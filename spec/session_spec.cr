@@ -20,6 +20,11 @@ module SessionSpecData
       credentials: CREDS, connect_timeout: connect_timeout,
       idle_timeout: idle_timeout, ping_interval: ping_interval)
   end
+
+  # Settings without a gateway, for specs that never touch the network.
+  def self.settings_without_gateway : KrikriAwsSsm::Settings
+    KrikriAwsSsm::Settings.new("i-0123456789", credentials: CREDS)
+  end
 end
 
 describe KrikriAwsSsm::Session do
@@ -38,6 +43,43 @@ describe KrikriAwsSsm::Session do
         session.terminate
       end
     ensure
+      gateway.close
+    end
+  end
+
+  it "redacts the stream URL and token from inspect" do
+    settings = SessionSpecData.settings_without_gateway
+    client = KrikriAwsSsm::Client.new(settings)
+    info = KrikriAwsSsm::SessionInfo.new("s-1",
+      "wss://ssmmessages.us-east-1.amazonaws.com/v1/data-channel/s-1?X-Amz-Signature=deadbeef",
+      "secret-token")
+    text = KrikriAwsSsm::Session.new(settings, client, info).inspect
+    refute_includes text, "secret-token"
+    refute_includes text, "X-Amz-Signature"
+    assert_includes text, "s-1"
+  end
+
+  it "bounds the data-channel upgrade read by the read timeout" do
+    listener = TCPServer.new("127.0.0.1", 0)
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS,
+      SessionSpecData.quiet_agent_options)
+    gateway.stream_url_override =
+      "ws://127.0.0.1:#{listener.local_address.port}/data-channel/s-fake-1"
+    settings = KrikriAwsSsm::Settings.new("i-0123456789",
+      endpoint_url: gateway.url, allow_insecure_endpoint: true,
+      credentials: SessionSpecData::CREDS, connect_timeout: 2.seconds,
+      read_timeout: 200.milliseconds)
+    begin
+      started = Time.monotonic
+      error = assert_raises(KrikriAwsSsm::HandshakeFailed) do
+        KrikriAwsSsm::Session.open(settings)
+      end
+      assert_includes error.message.to_s, "failed to open data channel"
+      elapsed = Time.monotonic - started
+      assert elapsed >= 200.milliseconds
+      assert elapsed < 3.seconds
+    ensure
+      listener.close
       gateway.close
     end
   end
@@ -789,6 +831,22 @@ describe "KrikriAwsSsm::Session KMS encryption" do
       ensure
         session.terminate
       end
+    ensure
+      gateway.close
+    end
+  end
+
+  it "fails the handshake on a non-object encryption challenge payload" do
+    options = SessionSpecData.quiet_agent_options
+    options.kms_key_id = "key-1"
+    options.challenge_payload = %(["nope"])
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS, options)
+    begin
+      error = assert_raises(KrikriAwsSsm::ProtocolError) do
+        KrikriAwsSsm::Session.open(
+          SessionSpecData.settings(gateway, kms_endpoint_url: gateway.url))
+      end
+      assert_equal "EncChallengeRequest is missing Challenge", error.message
     ensure
       gateway.close
     end

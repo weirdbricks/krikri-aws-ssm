@@ -81,6 +81,20 @@ describe KrikriAwsSsm::CredentialChain::Imds do
       server.close
     end
   end
+
+  it "ignores a non-object role credentials document" do
+    server = imds_server(credentials: %(["nope"]))
+    begin
+      CredentialSpecHelper.with_temp_dir do |dir|
+        chain = CredentialSpecHelper.chain(
+          {"AWS_EC2_METADATA_DISABLED" => "false"}, dir, imds_endpoint: server.url)
+        error = assert_raises(KrikriAwsSsm::CredentialsError) { chain.resolve }
+        assert_equal "Unable to locate credentials", error.message
+      end
+    ensure
+      server.close
+    end
+  end
 end
 
 describe KrikriAwsSsm::CredentialChain::Ecs do
@@ -102,6 +116,23 @@ describe KrikriAwsSsm::CredentialChain::Ecs do
         assert_equal "GET", request.method
         assert_equal "/v2/credentials/relative", request.resource
         assert_equal "container-token", request.headers["Authorization"]
+      end
+    ensure
+      server.close
+    end
+  end
+
+  it "ignores a non-object container credentials document" do
+    server = TestHttpServer.new do |_request|
+      TestHttpResponse.new(200, %(["nope"]))
+    end
+    begin
+      CredentialSpecHelper.with_temp_dir do |dir|
+        env = {"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" => "/v2/credentials/relative"}
+        chain = CredentialSpecHelper.chain(env, dir, container_endpoint: server.url)
+        error = assert_raises(KrikriAwsSsm::CredentialsError) { chain.resolve }
+        assert_equal "ECS container credentials are configured but could not be retrieved",
+          error.message
       end
     ensure
       server.close

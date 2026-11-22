@@ -25,6 +25,9 @@ module KrikriAwsSsm::Testing
     # body instead of its normal reply, so a spec can pin the client's
     # error mapping (TargetNotConnected, AccessDeniedException, ...).
     property control_failure : {Int32, String}? = nil
+    # Replaces the data-channel URL in StartSession/ResumeSession, so a spec
+    # can point the client at a non-responding peer.
+    property stream_url_override : String? = nil
 
     getter control_requests = Channel(HTTP::Request).new(32)
     getter upgrade_requests = Channel(HTTP::Request).new(8)
@@ -76,6 +79,9 @@ module KrikriAwsSsm::Testing
     end
 
     def stream_url : String
+      if override = @stream_url_override
+        return override
+      end
       base = "ws://127.0.0.1:#{@port}/data-channel/#{@session_id}"
       presigned? ? "#{base}?X-Amz-Signature=stub&X-Amz-Credential=stub" : base
     end
