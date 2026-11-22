@@ -9,8 +9,9 @@ permissions.
 Status: phases 1-8 complete (wire protocol and session core, fake harness,
 control plane, KMS encryption, credential chain, live validation, and the
 krikri SSM transport). The remaining krikri wiring and its test matrix
-(phases 9-10) live in krikri-playbook. See `docs/protocol.md` for the wire
-format and the design notes it is built from.
+(phases 9-10) live in krikri-playbook, where `synchronize:` push and pull now
+run through the session as well (live-verified, issue #1694). See
+`docs/protocol.md` for the wire format and the design notes it is built from.
 
 ## What it does
 
