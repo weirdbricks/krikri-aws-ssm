@@ -20,6 +20,11 @@ module KrikriAwsSsm
   class CredentialChain
     alias Provider = Proc(String?, Credentials?)
 
+    # One MFA prompt at a time, even when several sessions resolve
+    # concurrently: concurrent reads on one terminal would steal each other's
+    # codes.
+    @@mfa_prompt_mutex = Mutex.new
+
     getter config : Config
     getter providers : Array(Provider)
 
@@ -190,12 +195,6 @@ module KrikriAwsSsm
     private def resolve_assume_role(name : String, profile : Hash(String, String),
                                     role_arn : String, shared : SharedConfig,
                                     visited : Array(String)) : Credentials
-      if mfa_serial = profile["mfa_serial"]?
-        raise CredentialsError.new(
-          "Enter MFA code for #{mfa_serial}: interactive MFA is not supported yet " \
-          "(profile \"#{name}\"). Remove mfa_serial or use a non-MFA profile.")
-      end
-
       source = if source_profile = profile["source_profile"]?
                  resolve_source_profile(source_profile, name, shared, visited)
                elsif credential_source = profile["credential_source"]?
@@ -205,7 +204,15 @@ module KrikriAwsSsm
                    "The profile \"#{name}\" has role_arn but neither source_profile nor credential_source")
                end
 
-      assume_role(name, profile, role_arn, source)
+      # Each assume-role step carries its own `mfa_serial` (a source profile
+      # may have one too), so the prompt happens after the source resolves and
+      # once per STS call. Re-prompting on credential refresh is a deliberate
+      # divergence from botocore, which raises RefreshWithMFAUnsupportedError
+      # instead; the caller's provider can supply the fresh single-use code.
+      mfa = profile["mfa_serial"]?.try do |serial|
+        {serial: serial, code: mfa_token_code(serial, name)}
+      end
+      assume_role(name, profile, role_arn, source, mfa)
     end
 
     private def resolve_source_profile(source_name : String, parent_name : String,
@@ -247,13 +254,79 @@ module KrikriAwsSsm
     end
 
     private def assume_role(name : String, profile : Hash(String, String), role_arn : String,
-                            source : Credentials) : Credentials
+                            source : Credentials,
+                            mfa : NamedTuple(serial: String, code: String)? = nil) : Credentials
       session_name = profile["role_session_name"]? || Config::DEFAULT_ROLE_SESSION_NAME
       external_id = profile["external_id"]?
       duration = profile["duration_seconds"]?.try(&.to_i?)
       source_identity = profile["source_identity"]?
       Sts.new(@config, sts_region(profile)).assume_role(
-        role_arn, session_name, source, external_id, duration, source_identity)
+        role_arn, session_name, source, external_id, duration, source_identity, mfa)
+    end
+
+    # One-time code for *serial*: an injected provider wins, otherwise the
+    # terminal prompt. A non-interactive stdin without a provider is an error
+    # (never an empty or guessed code), because a controller such as krikri
+    # may be running unattended.
+    private def mfa_token_code(serial : String, profile : String) : String
+      if provider = @config.mfa_token_provider
+        code = provider.call(serial).strip
+        if code.empty?
+          raise CredentialsError.new(
+            "The MFA token provider returned no code for #{serial} (profile \"#{profile}\")")
+        end
+        return code
+      end
+
+      unless @config.mfa_input.tty?
+        raise CredentialsError.new(
+          "MFA is required for profile \"#{profile}\" (#{serial}) but no terminal is " \
+          "available to prompt for the code; run this interactively or supply an MFA token provider")
+      end
+
+      prompt_mfa_code(serial)
+    end
+
+    # Prompts on the configured streams. Echo is suppressed on the real
+    # terminal, or through an injected `mfa_echo_control`; any other injected
+    # IO is warned about so a caller knows the code may be visible. A process
+    # killed by a signal while the prompt is open leaves echo off: Crystal's
+    # default signal handling does not unwind the ensure.
+    private def prompt_mfa_code(serial : String) : String
+      input = @config.mfa_input
+      output = @config.mfa_output
+      @@mfa_prompt_mutex.synchronize do
+        hidden = terminal_echo(enabled: false)
+        begin
+          output.puts "Warning: MFA code input may be echoed." unless hidden
+          output.print "Enter MFA code for #{serial}: "
+          output.flush
+          code = input.gets
+        ensure
+          terminal_echo(enabled: true) if hidden
+        end
+        output.puts
+        code = code.try(&.strip)
+        if code.nil? || code.empty?
+          raise CredentialsError.new("No MFA code was entered for #{serial}")
+        end
+        code
+      end
+    end
+
+    # Disables or restores terminal echo, returning true when it took effect.
+    # The default only touches the real terminal; an injected IO cannot have
+    # its echo changed, and specs inject `mfa_echo_control` instead of stty.
+    private def terminal_echo(enabled : Bool) : Bool
+      if control = @config.mfa_echo_control
+        return control.call(enabled)
+      end
+      return false unless @config.mfa_input.same?(STDIN)
+      Process.run("stty", [enabled ? "echo" : "-echo"], input: Process::Redirect::Inherit,
+        output: Process::Redirect::Inherit,
+        error: Process::Redirect::Inherit).success?
+    rescue
+      false
     end
 
     private def web_identity_credentials(name : String, profile : Hash(String, String),

@@ -24,6 +24,12 @@ format and the design notes it is built from.
   (`credential_process`, `role_arn` + `source_profile` / `credential_source`,
   `web_identity_token_file`/IRSA), SSO cache + `sso:GetRoleCredentials`, IMDSv2,
   ECS container credentials.
+- MFA-token AssumeRole (`mfa_serial`) with `SerialNumber` + `TokenCode`: the
+  code is read from the terminal with echo suppressed, or from an injected
+  `mfa_token_provider`. Piped stdin and other non-interactive runs without a
+  provider fail with a clear error rather than guessing. A credential refresh
+  prompts again (a deliberate divergence: botocore refuses to refresh MFA
+  credentials).
 
 It is a byte-stream session library: the Ansible-shaped shell protocol, file
 transfer and error text live in krikri, not here.
@@ -33,7 +39,6 @@ transfer and error text live in krikri, not here.
 - The AWS CLI and `session-manager-plugin` (by design).
 - S3 file staging (krikri moves bytes through the session itself).
 - Port forwarding / smux, `AWS-StartSSHSession`, Windows sessions.
-- MFA-token AssumeRole (planned follow-up).
 
 ## Requirements and permissions
 

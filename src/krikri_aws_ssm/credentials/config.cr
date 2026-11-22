@@ -51,6 +51,21 @@ module KrikriAwsSsm
       property imds_transport : Transport?
       property ecs_transport : Transport?
 
+      # A one-time MFA code for an `mfa_serial`, keyed by the serial number.
+      # Callers that cannot use a terminal (CI, or a controller with its own
+      # prompt UI) inject this; nil falls back to the built-in terminal prompt.
+      # The provider runs while the chain holds its resolve mutex, so it must
+      # not call back into the same chain.
+      property mfa_token_provider : Proc(String, String)?
+      # The streams the built-in MFA prompt reads and writes. Specs inject
+      # memory IOs so a non-interactive test never touches the real terminal.
+      property mfa_input : IO
+      property mfa_output : IO
+      # Terminal echo control used by the built-in prompt (true = echo on,
+      # false = echo off; returns whether it took effect). nil runs `stty` on
+      # the real terminal; specs inject a recorder to exercise both branches.
+      property mfa_echo_control : Proc(Bool, Bool)?
+
       def initialize(env : Hash(String, String)? = nil, profile : String? = nil,
                      region : String? = nil, home_dir : String? = nil,
                      shared_credentials_file : String? = nil,
@@ -70,7 +85,11 @@ module KrikriAwsSsm
                      sts_transport : Transport? = nil,
                      sso_transport : Transport? = nil,
                      imds_transport : Transport? = nil,
-                     ecs_transport : Transport? = nil)
+                     ecs_transport : Transport? = nil,
+                     mfa_token_provider : Proc(String, String)? = nil,
+                     mfa_input : IO? = nil,
+                     mfa_output : IO? = nil,
+                     mfa_echo_control : Proc(Bool, Bool)? = nil)
         @env = env || ENV.to_h
         @profile = profile
         @region = region
@@ -97,6 +116,10 @@ module KrikriAwsSsm
         @sso_transport = sso_transport
         @imds_transport = imds_transport
         @ecs_transport = ecs_transport
+        @mfa_token_provider = mfa_token_provider
+        @mfa_input = mfa_input || STDIN
+        @mfa_output = mfa_output || STDERR
+        @mfa_echo_control = mfa_echo_control
       end
 
       def disabled_metadata? : Bool

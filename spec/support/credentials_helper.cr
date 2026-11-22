@@ -80,10 +80,16 @@ module CredentialSpecHelper
     URI::Params.parse(body)
   end
 
+  # `mfa_input` defaults to an empty memory IO (not a terminal), so an MFA
+  # profile in any spec fails instead of blocking the suite on a prompt.
   def config(env : Hash(String, String), dir : String,
              sts_endpoint : String? = nil, sso_endpoint : String? = nil,
              imds_endpoint : String? = nil, container_endpoint : String? = nil,
-             region : String? = nil, allow_insecure : Bool = true) : KrikriAwsSsm::CredentialChain::Config
+             region : String? = nil, allow_insecure : Bool = true,
+             mfa_token_provider : Proc(String, String)? = nil,
+             mfa_input : IO? = IO::Memory.new,
+             mfa_output : IO? = nil,
+             mfa_echo_control : Proc(Bool, Bool)? = nil) : KrikriAwsSsm::CredentialChain::Config
     KrikriAwsSsm::CredentialChain::Config.new(
       env: env,
       region: region,
@@ -94,15 +100,23 @@ module CredentialSpecHelper
       sso_endpoint_url: sso_endpoint,
       imds_endpoint: imds_endpoint,
       container_metadata_endpoint: container_endpoint,
-      allow_insecure_endpoint: allow_insecure)
+      allow_insecure_endpoint: allow_insecure,
+      mfa_token_provider: mfa_token_provider,
+      mfa_input: mfa_input,
+      mfa_output: mfa_output,
+      mfa_echo_control: mfa_echo_control)
   end
 
   def chain(env : Hash(String, String), dir : String,
             sts_endpoint : String? = nil, sso_endpoint : String? = nil,
             imds_endpoint : String? = nil, container_endpoint : String? = nil,
-            region : String? = nil, allow_insecure : Bool = true) : KrikriAwsSsm::CredentialChain
+            region : String? = nil, allow_insecure : Bool = true,
+            mfa_token_provider : Proc(String, String)? = nil,
+            mfa_input : IO? = IO::Memory.new,
+            mfa_output : IO? = nil,
+            mfa_echo_control : Proc(Bool, Bool)? = nil) : KrikriAwsSsm::CredentialChain
     KrikriAwsSsm::CredentialChain.new(
       config(env, dir, sts_endpoint, sso_endpoint, imds_endpoint, container_endpoint,
-        region, allow_insecure))
+        region, allow_insecure, mfa_token_provider, mfa_input, mfa_output, mfa_echo_control))
   end
 end

@@ -26,7 +26,8 @@ module KrikriAwsSsm
 
       def assume_role(role_arn : String, session_name : String, source : Credentials,
                       external_id : String? = nil, duration_seconds : Int32? = nil,
-                      source_identity : String? = nil) : Credentials
+                      source_identity : String? = nil,
+                      mfa : NamedTuple(serial: String, code: String)? = nil) : Credentials
         params = [
           {"Action", "AssumeRole"},
           {"Version", API_VERSION},
@@ -36,6 +37,12 @@ module KrikriAwsSsm
         params << {"ExternalId", external_id} if external_id
         params << {"DurationSeconds", duration_seconds.to_s} if duration_seconds
         params << {"SourceIdentity", source_identity} if source_identity
+        # A role protected by MFA needs both the virtual-device serial and the
+        # current one-time code; STS rejects either one alone.
+        if mfa
+          params << {"SerialNumber", mfa[:serial]}
+          params << {"TokenCode", mfa[:code]}
+        end
         response = perform("AssumeRole", encode_form(params), source)
         parse_credentials(response.body, "AssumeRole")
       end

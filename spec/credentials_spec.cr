@@ -3,6 +3,14 @@ require "./support/credentials_helper"
 
 include CredentialSpecHelper
 
+# A terminal-shaped IO: reads the fixed buffer and claims to be a tty, so the
+# MFA prompt path runs without a real terminal or stty.
+private class FakeTty < IO::Memory
+  def tty? : Bool
+    true
+  end
+end
+
 describe KrikriAwsSsm::CredentialChain do
   it "never reveals secrets from Credentials#to_s" do
     credentials = KrikriAwsSsm::Credentials.new("AKIDEXAMPLE", "super-secret", "session-token")
@@ -454,18 +462,286 @@ describe KrikriAwsSsm::CredentialChain do
     end
   end
 
-  it "fails an MFA profile without prompting" do
+  it "asks the injected provider for the MFA code and sends SerialNumber and TokenCode" do
+    server = TestHttpServer.new do |_request|
+      TestHttpResponse.new(200, CredentialSpecHelper.sts_response("AssumeRole"))
+    end
+    begin
+      CredentialSpecHelper.with_temp_dir do |dir|
+        CredentialSpecHelper.write(File.join(dir, "config"), <<-INI)
+          [profile base]
+          aws_access_key_id = BASEKEY
+          aws_secret_access_key = BASESECRET
+
+          [profile mfa]
+          role_arn = arn:aws:iam::123456789012:role/MfaRole
+          source_profile = base
+          mfa_serial = arn:aws:iam::123456789012:mfa/user
+          INI
+
+        seen = [] of String
+        chain = CredentialSpecHelper.chain(
+          {"AWS_EC2_METADATA_DISABLED" => "true"}, dir, sts_endpoint: server.url,
+          mfa_token_provider: ->(serial : String) { seen << serial; "123456" })
+        credentials = chain.resolve("mfa")
+
+        assert_equal "ASSUMEDKEY", credentials.access_key
+        assert_equal ["arn:aws:iam::123456789012:mfa/user"], seen
+        params = CredentialSpecHelper.form_params(server.next_request.body.to_s)
+        assert_equal "arn:aws:iam::123456789012:mfa/user", params["SerialNumber"]
+        assert_equal "123456", params["TokenCode"]
+      end
+    ensure
+      server.close
+    end
+  end
+
+  it "prompts on the terminal for an MFA code when no provider is injected" do
+    server = TestHttpServer.new do |_request|
+      TestHttpResponse.new(200, CredentialSpecHelper.sts_response("AssumeRole"))
+    end
+    begin
+      CredentialSpecHelper.with_temp_dir do |dir|
+        CredentialSpecHelper.write(File.join(dir, "config"), <<-INI)
+          [profile base]
+          aws_access_key_id = BASEKEY
+          aws_secret_access_key = BASESECRET
+
+          [profile mfa]
+          role_arn = arn:aws:iam::123456789012:role/MfaRole
+          source_profile = base
+          mfa_serial = arn:aws:iam::123456789012:mfa/user
+          INI
+
+        output = IO::Memory.new
+        chain = CredentialSpecHelper.chain(
+          {"AWS_EC2_METADATA_DISABLED" => "true"}, dir, sts_endpoint: server.url,
+          mfa_input: FakeTty.new("123456\n"), mfa_output: output)
+        credentials = chain.resolve("mfa")
+
+        assert_equal "ASSUMEDKEY", credentials.access_key
+        params = CredentialSpecHelper.form_params(server.next_request.body.to_s)
+        assert_equal "123456", params["TokenCode"]
+        assert_includes output.to_s,
+          "Enter MFA code for arn:aws:iam::123456789012:mfa/user: "
+        # An injected IO cannot hide its input, so the prompt says so.
+        assert_includes output.to_s, "Warning: MFA code input may be echoed."
+      end
+    ensure
+      server.close
+    end
+  end
+
+  it "suppresses terminal echo while reading the MFA code" do
+    server = TestHttpServer.new do |_request|
+      TestHttpResponse.new(200, CredentialSpecHelper.sts_response("AssumeRole"))
+    end
+    begin
+      CredentialSpecHelper.with_temp_dir do |dir|
+        CredentialSpecHelper.write(File.join(dir, "config"), <<-INI)
+          [profile base]
+          aws_access_key_id = BASEKEY
+          aws_secret_access_key = BASESECRET
+
+          [profile mfa]
+          role_arn = arn:aws:iam::123456789012:role/MfaRole
+          source_profile = base
+          mfa_serial = arn:aws:iam::123456789012:mfa/user
+          INI
+
+        echo_calls = [] of Bool
+        output = IO::Memory.new
+        chain = CredentialSpecHelper.chain(
+          {"AWS_EC2_METADATA_DISABLED" => "true"}, dir, sts_endpoint: server.url,
+          mfa_input: FakeTty.new("123456\n"), mfa_output: output,
+          mfa_echo_control: ->(enabled : Bool) { echo_calls << enabled; true })
+        chain.resolve("mfa")
+
+        assert_equal [false, true], echo_calls
+        refute_includes output.to_s, "may be echoed"
+      end
+    ensure
+      server.close
+    end
+  end
+
+  it "raises when the MFA prompt reaches end of input without a code" do
     CredentialSpecHelper.with_temp_dir do |dir|
       CredentialSpecHelper.write(File.join(dir, "config"), <<-INI)
+        [profile base]
+        aws_access_key_id = BASEKEY
+        aws_secret_access_key = BASESECRET
+
         [profile mfa]
         role_arn = arn:aws:iam::123456789012:role/MfaRole
-        source_profile = mfa
+        source_profile = base
+        mfa_serial = arn:aws:iam::123456789012:mfa/user
+        INI
+      chain = CredentialSpecHelper.chain(
+        {"AWS_EC2_METADATA_DISABLED" => "true"}, dir,
+        mfa_input: FakeTty.new(""), mfa_output: IO::Memory.new)
+      error = assert_raises(KrikriAwsSsm::CredentialsError) { chain.resolve("mfa") }
+      assert_includes error.message.to_s, "No MFA code was entered"
+      assert_includes error.message.to_s, "arn:aws:iam::123456789012:mfa/user"
+    end
+  end
+
+  it "keeps the MFA code out of an STS error message" do
+    server = TestHttpServer.new do |_request|
+      TestHttpResponse.new(403, <<-XML)
+        <ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+          <Error>
+            <Type>Sender</Type>
+            <Code>AccessDenied</Code>
+            <Message>MultiFactorAuthentication failed</Message>
+          </Error>
+        </ErrorResponse>
+        XML
+    end
+    begin
+      CredentialSpecHelper.with_temp_dir do |dir|
+        CredentialSpecHelper.write(File.join(dir, "config"), <<-INI)
+          [profile base]
+          aws_access_key_id = BASEKEY
+          aws_secret_access_key = BASESECRET
+
+          [profile mfa]
+          role_arn = arn:aws:iam::123456789012:role/MfaRole
+          source_profile = base
+          mfa_serial = arn:aws:iam::123456789012:mfa/user
+          INI
+
+        chain = CredentialSpecHelper.chain(
+          {"AWS_EC2_METADATA_DISABLED" => "true"}, dir, sts_endpoint: server.url,
+          mfa_token_provider: ->(_serial : String) { "654321" })
+        error = assert_raises(KrikriAwsSsm::CredentialsError) { chain.resolve("mfa") }
+        assert_includes error.message.to_s, "STS AssumeRole failed"
+        assert_includes error.message.to_s, "MultiFactorAuthentication failed"
+        refute_includes error.message.to_s, "654321"
+      end
+    ensure
+      server.close
+    end
+  end
+
+  it "prompts once per assume-role step with each profile's own mfa_serial" do
+    server = TestHttpServer.new do |_request|
+      TestHttpResponse.new(200, CredentialSpecHelper.sts_response("AssumeRole"))
+    end
+    begin
+      CredentialSpecHelper.with_temp_dir do |dir|
+        CredentialSpecHelper.write(File.join(dir, "config"), <<-INI)
+          [profile base]
+          aws_access_key_id = BASEKEY
+          aws_secret_access_key = BASESECRET
+
+          [profile mid]
+          role_arn = arn:aws:iam::123456789012:role/MidRole
+          source_profile = base
+          mfa_serial = arn:aws:iam::123456789012:mfa/mid
+
+          [profile top]
+          role_arn = arn:aws:iam::123456789012:role/TopRole
+          source_profile = mid
+          mfa_serial = arn:aws:iam::123456789012:mfa/top
+          INI
+
+        seen = [] of String
+        chain = CredentialSpecHelper.chain(
+          {"AWS_EC2_METADATA_DISABLED" => "true"}, dir, sts_endpoint: server.url,
+          mfa_token_provider: ->(serial : String) { seen << serial; "123456" })
+        chain.resolve("top")
+
+        assert_equal ["arn:aws:iam::123456789012:mfa/mid",
+                      "arn:aws:iam::123456789012:mfa/top"], seen
+        mid_params = CredentialSpecHelper.form_params(server.next_request.body.to_s)
+        top_params = CredentialSpecHelper.form_params(server.next_request.body.to_s)
+        assert_equal "arn:aws:iam::123456789012:mfa/mid", mid_params["SerialNumber"]
+        assert_equal "arn:aws:iam::123456789012:mfa/top", top_params["SerialNumber"]
+      end
+    ensure
+      server.close
+    end
+  end
+
+  it "refuses an MFA profile when no terminal can prompt and no provider exists" do
+    CredentialSpecHelper.with_temp_dir do |dir|
+      CredentialSpecHelper.write(File.join(dir, "config"), <<-INI)
+        [profile base]
+        aws_access_key_id = BASEKEY
+        aws_secret_access_key = BASESECRET
+
+        [profile mfa]
+        role_arn = arn:aws:iam::123456789012:role/MfaRole
+        source_profile = base
         mfa_serial = arn:aws:iam::123456789012:mfa/user
         INI
       chain = CredentialSpecHelper.chain({"AWS_EC2_METADATA_DISABLED" => "true"}, dir)
       error = assert_raises(KrikriAwsSsm::CredentialsError) { chain.resolve("mfa") }
-      assert_includes error.message.to_s, "MFA"
+      assert_includes error.message.to_s, "MFA is required"
       assert_includes error.message.to_s, "arn:aws:iam::123456789012:mfa/user"
+      assert_includes error.message.to_s, "no terminal"
+    end
+  end
+
+  it "rejects an empty MFA code from the injected provider" do
+    CredentialSpecHelper.with_temp_dir do |dir|
+      CredentialSpecHelper.write(File.join(dir, "config"), <<-INI)
+        [profile base]
+        aws_access_key_id = BASEKEY
+        aws_secret_access_key = BASESECRET
+
+        [profile mfa]
+        role_arn = arn:aws:iam::123456789012:role/MfaRole
+        source_profile = base
+        mfa_serial = arn:aws:iam::123456789012:mfa/user
+        INI
+      chain = CredentialSpecHelper.chain(
+        {"AWS_EC2_METADATA_DISABLED" => "true"}, dir,
+        mfa_token_provider: ->(_serial : String) { "  " })
+      error = assert_raises(KrikriAwsSsm::CredentialsError) { chain.resolve("mfa") }
+      assert_includes error.message.to_s, "returned no code"
+    end
+  end
+
+  it "re-prompts for a fresh MFA code when the assumed role credentials refresh" do
+    fetches = 0
+    server = TestHttpServer.new do |_request|
+      fetches += 1
+      TestHttpResponse.new(200, CredentialSpecHelper.sts_response("AssumeRole",
+        access_key: "ASSUMED#{fetches}", expires_at: Time.utc + 2.minutes))
+    end
+    begin
+      CredentialSpecHelper.with_temp_dir do |dir|
+        CredentialSpecHelper.write(File.join(dir, "config"), <<-INI)
+          [profile base]
+          aws_access_key_id = BASEKEY
+          aws_secret_access_key = BASESECRET
+
+          [profile mfa]
+          role_arn = arn:aws:iam::123456789012:role/MfaRole
+          source_profile = base
+          mfa_serial = arn:aws:iam::123456789012:mfa/user
+          INI
+
+        calls = 0
+        chain = CredentialSpecHelper.chain(
+          {"AWS_EC2_METADATA_DISABLED" => "true"}, dir, sts_endpoint: server.url,
+          mfa_token_provider: ->(_serial : String) { calls += 1; calls == 1 ? "111111" : "222222" })
+        first = chain.resolve("mfa")
+        assert first.refresh_needed?
+        second = chain.refresh(first)
+        assert_equal "ASSUMED1", first.access_key
+        assert_equal "ASSUMED2", second.access_key
+
+        assert_equal 2, calls
+        first_params = CredentialSpecHelper.form_params(server.next_request.body.to_s)
+        second_params = CredentialSpecHelper.form_params(server.next_request.body.to_s)
+        assert_equal "111111", first_params["TokenCode"]
+        assert_equal "222222", second_params["TokenCode"]
+      end
+    ensure
+      server.close
     end
   end
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.3 (2026-11-21)
+
+- Support MFA-token AssumeRole (issue #1696): a profile with `role_arn` and
+  `mfa_serial` now prompts for the one-time code on the terminal (echo
+  suppressed when `stty` allows it) and sends `SerialNumber` + `TokenCode`
+  with AssumeRole. Non-interactive callers can inject
+  `CredentialChain::Config#mfa_token_provider`; when neither a terminal nor a
+  provider is available the chain fails with a clear error instead of guessing.
+  Terminal prompts are serialized across concurrent sessions, and the code is
+  never logged. A credential refresh prompts again rather than raising as
+  botocore does (`RefreshWithMFAUnsupportedError`); that divergence is
+  deliberate, so a provider can supply the fresh single-use code.
+
 ## 0.2.2 (2026-11-21)
 
 - Fix the sustained-upload collapse behind issue #1692. Measured on a live
