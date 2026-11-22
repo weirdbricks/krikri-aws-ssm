@@ -52,6 +52,7 @@ module KrikriAwsSsm::Testing
     @acks_held = false
     @held_acks = [] of AcknowledgeContent
     @stopped = false
+    @channel_closed_sent = false
     @handshake_sent = false
     @shell_started = false
     @encrypter : Encrypter?
@@ -115,6 +116,7 @@ module KrikriAwsSsm::Testing
         end
       end
       send_stream_message(MessageType::CHANNEL_CLOSED, PayloadType::Undefined.value, payload.to_slice)
+      @channel_closed_sent = true
     end
 
     def pause_publication : Nil
@@ -137,7 +139,7 @@ module KrikriAwsSsm::Testing
       @process.try do |process|
         process.terminate unless process.terminated?
       end
-      @ws.close
+      @ws.close unless @channel_closed_sent
     rescue
     end
 
@@ -407,6 +409,9 @@ module KrikriAwsSsm::Testing
       code = status.normal_exit? ? status.exit_code : 1
       send_exit_code(code)
       send_channel_closed("")
+      # The channel_closed frame above hands the shutdown to the client (see
+      # #stop): closing the socket here raced it and the client lost both the
+      # exit status and the close reason.
       stop
     rescue
     end

@@ -127,6 +127,26 @@ module KrikriAwsSsm
       write(text.to_slice)
     end
 
+    # Chunks the bytes into input_stream_data messages without `write`'s
+    # reference-plugin LF rewrite. A caller moving a binary stream through the
+    # pty (`rsync`'s protocol, for instance) must not have a chunk that
+    # happens to be the single byte LF turned into CR; whether LF is safe at
+    # all is the caller's terminal-state decision, not this method's.
+    # Interleaving and failure rules are the same as `write`.
+    def write_raw(bytes : Bytes) : Nil
+      raise_closed if closed?
+      return if bytes.empty?
+
+      Chunker.chunks(bytes, @settings.chunk_size).each do |chunk|
+        await_send_room
+        send_input(PayloadType::Output.value, chunk)
+      end
+    end
+
+    def write_raw(text : String) : Nil
+      write_raw(text.to_slice)
+    end
+
     # Outbound messages still awaiting acknowledgement.
     def pending : Int32
       @reliability.pending

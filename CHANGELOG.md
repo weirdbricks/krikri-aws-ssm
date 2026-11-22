@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 (2026-11-22)
+
+- Add `Session#write_raw`, a binary-safe write that skips `write`'s
+  reference-plugin LF-to-CR rewrite. Callers moving a binary protocol through a
+  pty (krikri's `synchronize:` bridge) must not have a chunk that happens to be
+  a single LF turned into CR. Specs pin both behaviours.
+- Fix the test agent dropping its last two frames when a shell exits: it closed
+  the websocket immediately after sending `ExitCode` + `ChannelClosed`, and the
+  client saw the transport drop first, losing the exit status and the close
+  reason. It now leaves the shutdown to the client after `ChannelClosed`, as a
+  real agent does.
+
 ## 0.2.3 (2026-11-21)
 
 - Support MFA-token AssumeRole (issue #1696): a profile with `role_arn` and

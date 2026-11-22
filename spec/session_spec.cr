@@ -213,6 +213,53 @@ describe KrikriAwsSsm::Session do
     end
   end
 
+  it "rewrites a lone LF for write and leaves it alone for write_raw" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    begin
+      session = KrikriAwsSsm::Session.open(SessionSpecData.settings(gateway))
+      begin
+        agent = receive_with_timeout(gateway.agents)
+        receive_with_timeout(agent.handshake_responses)
+
+        # The reference plugin's pty workaround: a chunk that is exactly LF
+        # becomes CR so the line discipline submits it as Enter.
+        session.write(Bytes[10_u8])
+        assert_equal Bytes[13_u8], receive_with_timeout(agent.received_input)
+
+        # A binary stream (rsync's protocol) must reach the pty untouched.
+        session.write_raw(Bytes[10_u8])
+        assert_equal Bytes[10_u8], receive_with_timeout(agent.received_input)
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
+  it "delivers the shell's exit code and AgentClosed when the shell exits" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    begin
+      session = KrikriAwsSsm::Session.open(SessionSpecData.settings(gateway))
+      begin
+        agent = receive_with_timeout(gateway.agents)
+        receive_with_timeout(agent.handshake_responses)
+
+        session.write("exit 3\n")
+        while session.read?
+        end
+
+        assert_equal 3, session.exit_code
+        assert_equal KrikriAwsSsm::CloseReason::AgentClosed, session.close_reason
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
   it "moves a 1MiB payload in both directions" do
     gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
     gateway.agent_options = SessionSpecData.quiet_agent_options
