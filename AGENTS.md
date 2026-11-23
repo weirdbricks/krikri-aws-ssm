@@ -18,10 +18,6 @@ terminal setup, base64 file transfer, become wrappers, error text, batching)
 belong in krikri, not here. Keep the boundary strict: krikri must be able to
 consume this shard without pulling Ansible semantics into it.
 
-The design and phasing for the krikri integration (issue #1664) is in
-[`docs/1664-plan.md`](docs/1664-plan.md); update it when a decision changes, and
-delete or archive it once the feature ships.
-
 ## Commands
 
 ```sh
