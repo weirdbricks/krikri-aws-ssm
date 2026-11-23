@@ -782,6 +782,61 @@ describe KrikriAwsSsm::Session do
     end
   end
 
+  it "verifies control-plane and upgrade signatures in the configured region" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS,
+      region: "us-west-2")
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    settings = KrikriAwsSsm::Settings.new("i-0123456789", region: "us-west-2",
+      endpoint_url: gateway.url, allow_insecure_endpoint: true,
+      credentials: SessionSpecData::CREDS, connect_timeout: 5.seconds,
+      idle_timeout: 5.seconds)
+    begin
+      session = KrikriAwsSsm::Session.open(settings)
+      begin
+        result = gateway.next_upgrade_result
+        refute_nil result
+        assert_equal "us-west-2", settings.region
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
+  it "keeps its state safe to read while another fiber closes it" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    begin
+      session = KrikriAwsSsm::Session.open(SessionSpecData.settings(gateway))
+      begin
+        receive_with_timeout(gateway.agents)
+        done = Atomic(Int32).new(0)
+        4.times do
+          spawn do
+            20.times do
+              session.close_reason
+              session.error
+              session.exit_code
+              session.channel_output
+              session.session_type
+              session.encryption_enabled?
+              session.closed?
+              sleep 1.millisecond
+            end
+            done.add(1)
+          end
+        end
+        session.terminate
+        assert wait_until(2.seconds) { done.get == 4 }
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
   it "skips SigV4 signing for a presigned StreamUrl" do
     gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS,
       presigned: true)
@@ -829,6 +884,38 @@ describe KrikriAwsSsm::Session do
       gateway.close
     end
   end
+  it "delivers output that arrives on the resumed channel" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    begin
+      session = KrikriAwsSsm::Session.open(SessionSpecData.settings(gateway))
+      begin
+        first_agent = receive_with_timeout(gateway.agents)
+        receive_with_timeout(first_agent.handshake_responses)
+        # The sequence state survives a resume, so the new fake agent must
+        # continue numbering where the old one stopped.
+        next_sequence = first_agent.next_output_sequence
+        first_agent.abrupt_close
+        assert wait_until(2.seconds) { session.closed? }
+
+        resumed_options = SessionSpecData.quiet_agent_options
+        resumed_options.handshake = false
+        gateway.agent_options = resumed_options
+        session.resume
+        second_agent = receive_with_timeout(gateway.agents)
+        receive_with_timeout(second_agent.open_messages)
+
+        second_agent.send_output("after\n", sequence: next_sequence)
+        assert_equal "after\n", String.new(read_required(session).bytes)
+        refute session.closed?
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
   it "re-closes the session when resume cannot reopen the channel" do
     gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
     gateway.agent_options = SessionSpecData.quiet_agent_options

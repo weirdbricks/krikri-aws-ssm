@@ -27,7 +27,6 @@ module KrikriAwsSsm
     getter sequence_number : Int64
     getter flags : UInt64
     getter message_id : UUID
-    getter payload_digest : Bytes
     getter payload_type : UInt32
     getter payload : Bytes
 
@@ -39,14 +38,19 @@ module KrikriAwsSsm
                    @created_date : UInt64 = Time.utc.to_unix_ms.to_u64,
                    @schema_version : UInt32 = 1_u32)
       @header_length = HEADER_LENGTH.to_u32
-      @payload_digest = Digest::SHA256.digest(@payload)
     end
 
     private def initialize(@header_length : UInt32, @message_type : String,
                            @schema_version : UInt32, @created_date : UInt64,
                            @sequence_number : Int64, @flags : UInt64,
-                           @message_id : UUID, @payload_digest : Bytes,
-                           @payload_type : UInt32, @payload : Bytes)
+                           @message_id : UUID, @payload_type : UInt32,
+                           @payload : Bytes)
+    end
+
+    # Always computed from the current payload, so it cannot go stale if a
+    # caller mutates the buffer after construction.
+    def payload_digest : Bytes
+      Digest::SHA256.digest(@payload)
     end
 
     def syn? : Bool
@@ -76,7 +80,7 @@ module KrikriAwsSsm
       write_u64(bytes, 48, @sequence_number.to_u64!)
       write_u64(bytes, 56, @flags)
       UUIDCodec.encode(@message_id).copy_to(bytes[64, 16])
-      Digest::SHA256.digest(@payload).copy_to(bytes[80, 32])
+      payload_digest.copy_to(bytes[80, 32])
       write_u32(bytes, 112, @payload_type)
       write_u32(bytes, 116, @payload.size.to_u32)
       @payload.copy_to(bytes[TOTAL_HEADER_LENGTH, @payload.size]) unless @payload.empty?
@@ -91,6 +95,8 @@ module KrikriAwsSsm
       header_length = read_u32(bytes, 0)
       raise ProtocolError.new("unexpected header length #{header_length}, expected #{HEADER_LENGTH}") unless header_length == HEADER_LENGTH
 
+      # The type is ASCII by construction; no UTF-8 validation is done on a
+      # hostile field, matching the reference (dispatch is an exact match).
       message_type = String.new(bytes[4, MESSAGE_TYPE_LENGTH]).tr("\0", " ").strip
       raise ProtocolError.new("message type is empty") if message_type.empty?
 
@@ -117,7 +123,7 @@ module KrikriAwsSsm
 
       verify_digest!(message_type, payload, payload_digest)
       new(header_length, message_type, schema_version, created_date, sequence_number,
-        flags, message_id, payload_digest, payload_type, payload)
+        flags, message_id, payload_type, payload)
     end
 
     # Matches `ClientMessage.Validate`: zero-length payloads and
@@ -132,6 +138,11 @@ module KrikriAwsSsm
     private def write_message_type(bytes : Bytes) : Nil
       if @message_type.bytesize > MESSAGE_TYPE_LENGTH
         raise ProtocolError.new("message type #{@message_type.inspect} exceeds #{MESSAGE_TYPE_LENGTH} bytes")
+      end
+      # Decode strips and maps NUL to a space, so such a type would not
+      # round-trip; reject it here instead of writing a frame that changes.
+      if @message_type.includes?('\0') || @message_type != @message_type.strip
+        raise ProtocolError.new("message type #{@message_type.inspect} must not contain NUL or edge whitespace")
       end
       bytes[4, MESSAGE_TYPE_LENGTH].fill(' '.ord.to_u8)
       @message_type.to_slice.copy_to(bytes[4, @message_type.bytesize])

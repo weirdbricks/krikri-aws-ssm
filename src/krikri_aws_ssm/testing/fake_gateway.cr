@@ -29,14 +29,16 @@ module KrikriAwsSsm::Testing
     # can point the client at a non-responding peer.
     property stream_url_override : String? = nil
 
-    getter control_requests = Channel(HTTP::Request).new(32)
-    getter upgrade_requests = Channel(HTTP::Request).new(8)
-    getter upgrade_results = Channel(SigV4::Result).new(8)
-    getter upgrade_errors = Channel(String).new(8)
-    getter agents = Channel(FakeAgent).new(8)
-    getter resumed_sessions = Channel(String).new(8)
-    getter terminated_sessions = Channel(String).new(8)
-    getter kms_requests = Channel(HTTP::Request).new(16)
+    # Capacities are generous: a handler blocks the server fiber on `send`
+    # once a channel is full, so a busy spec must not stall the fake gateway.
+    getter control_requests = Channel(HTTP::Request).new(1024)
+    getter upgrade_requests = Channel(HTTP::Request).new(64)
+    getter upgrade_results = Channel(SigV4::Result).new(64)
+    getter upgrade_errors = Channel(String).new(64)
+    getter agents = Channel(FakeAgent).new(64)
+    getter resumed_sessions = Channel(String).new(64)
+    getter terminated_sessions = Channel(String).new(64)
+    getter kms_requests = Channel(HTTP::Request).new(256)
 
     # Waits for the next websocket upgrade's verified signed-header set.
     #
@@ -60,7 +62,7 @@ module KrikriAwsSsm::Testing
 
     def initialize(@credentials : Credentials,
                    @agent_options : FakeAgent::Options = FakeAgent::Options.new,
-                   @presigned : Bool = false)
+                   @presigned : Bool = false, @region : String = "us-east-1")
       @kms_plaintext_key = @agent_options.kms_plaintext_key
       @kms_ciphertext_blob = Bytes[9_u8, 8_u8, 7_u8, 6_u8]
       @server = HTTP::Server.new do |context|
@@ -104,7 +106,7 @@ module KrikriAwsSsm::Testing
       service = request.headers["X-Amz-Target"]?.try(&.starts_with?("TrentService.")) ? "kms" : "ssm"
 
       begin
-        SigV4.verify(captured, @credentials, "us-east-1", service)
+        SigV4.verify(captured, @credentials, @region, service)
       rescue ex : SigV4::VerificationError
         respond(context, 400,
           %({"__type":"SignatureDoesNotMatch","message":#{ex.message.to_json}}))
@@ -150,7 +152,7 @@ module KrikriAwsSsm::Testing
       respond(context, 200, JSON.build do |json|
         json.object do
           json.field "CiphertextBlob", Base64.strict_encode(kms_ciphertext_blob)
-          json.field "KeyId", "arn:aws:kms:us-east-1:123456789012:key/fake"
+          json.field "KeyId", "arn:aws:kms:#{@region}:123456789012:key/fake"
           json.field "Plaintext", Base64.strict_encode(kms_plaintext_key)
         end
       end)
@@ -161,9 +163,25 @@ module KrikriAwsSsm::Testing
       @upgrade_requests.send(
         HTTP::Request.new(request.method, request.resource, request.headers))
 
-      unless presigned?
+      if presigned?
+        # A presigned URL must carry its signature and must not be signed
+        # again; otherwise the presigned path is never actually exercised.
+        query = URI::Params.parse(request.resource.split('?', 2)[1]? || "")
+        unless query["X-Amz-Signature"]?
+          @upgrade_errors.send("presigned upgrade is missing X-Amz-Signature")
+          respond(context, 403,
+            %({"__type":"InvalidRequest","message":"presigned upgrade is missing X-Amz-Signature"}))
+          return
+        end
+        if request.headers["Authorization"]?
+          @upgrade_errors.send("presigned upgrade must not carry Authorization")
+          respond(context, 403,
+            %({"__type":"InvalidRequest","message":"presigned upgrade must not carry Authorization"}))
+          return
+        end
+      else
         begin
-          result = SigV4.verify(request, @credentials, "us-east-1", "ssmmessages")
+          result = SigV4.verify(request, @credentials, @region, "ssmmessages")
           @upgrade_results.send(result)
         rescue ex : SigV4::VerificationError
           @upgrade_errors.send(ex.message.to_s)

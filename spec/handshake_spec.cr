@@ -44,6 +44,11 @@ describe KrikriAwsSsm::Handshake do
     assert_equal "key-1", request.requested_client_actions[1].action_parameters.try(&.["KMSKeyId"]).try(&.as_s)
   end
 
+  it "emits a null Challenge like the reference struct" do
+    request = KrikriAwsSsm::Handshake::KMSEncryptionRequest.new("key-1")
+    assert_equal %({"KMSKeyId":"key-1","Challenge":null}), request.to_json
+  end
+
   it "parses KMSEncryptionRequest parameters and round-trips them" do
     request = KrikriAwsSsm::Handshake::KMSEncryptionRequest.from_json(
       %({"KMSKeyId":"key-1","Challenge":"Y2hhbGxlbmdl"}))

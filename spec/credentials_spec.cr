@@ -43,6 +43,21 @@ describe KrikriAwsSsm::CredentialChain do
     assert_includes text, "AKID..."
   end
 
+  it "uses the exact expiry and refresh-window boundaries" do
+    now = Time.utc
+    expires = now + 10.minutes
+    credentials = KrikriAwsSsm::Credentials.new("A", "B", expires_at: expires)
+
+    refute credentials.expired?(now)
+    assert credentials.expired?(expires)
+    assert credentials.expired?(expires + 1.second)
+
+    refute credentials.refresh_needed?(now)
+    assert credentials.refresh_needed?(expires - 5.minutes)
+    assert credentials.refresh_needed?(expires - 5.minutes + 1.millisecond)
+    refute KrikriAwsSsm::Credentials.new("A", "B").refresh_needed?(now)
+  end
+
   it "prefers environment credentials over any profile" do
     CredentialSpecHelper.with_temp_dir do |dir|
       CredentialSpecHelper.write(File.join(dir, "credentials"),

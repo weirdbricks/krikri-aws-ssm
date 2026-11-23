@@ -64,7 +64,7 @@ module KrikriAwsSsm
               @config.container_timeout, @config.container_timeout)
           rescue ex : IO::Error
             raise ex if attempt >= attempts
-            sleep 1.second
+            sleep @config.container_retry_delay
           end
         end
       end

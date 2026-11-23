@@ -36,6 +36,9 @@ module KrikriAwsSsm
     @previous : Hash(String, Credentials)
     @last_profile : String?
     @mutex : Mutex
+    # Parsed once per chain, like botocore's session config: re-reading both
+    # INI files on every resolve was pure overhead.
+    @shared_config_cache : SharedConfig?
 
     # A caller-injected provider list, kept for the phase-1 public surface.
     def initialize(providers : Array(Provider))
@@ -45,6 +48,7 @@ module KrikriAwsSsm
       @previous = {} of String => Credentials
       @last_profile = nil
       @mutex = Mutex.new
+      @shared_config_cache = nil
     end
 
     def initialize(@config : Config = Config.new)
@@ -52,6 +56,7 @@ module KrikriAwsSsm
       @previous = {} of String => Credentials
       @last_profile = nil
       @mutex = Mutex.new
+      @shared_config_cache = nil
       @providers = [] of Provider
       @providers << ->(_profile : String?) { from_environment }
       @providers << ->(_profile : String?) { from_environment_web_identity }
@@ -416,6 +421,9 @@ module KrikriAwsSsm
       end
       raise status if status.is_a?(Exception)
       unless status.success?
+        # Botocore puts the child's stderr verbatim in the error; a process
+        # that printed credentials there would leak them, which is deliberate
+        # parity (hiding it hides the message that explains the failure).
         detail = stderr.to_s.strip
         detail = "no stderr output" if detail.empty?
         raise CredentialsError.new(
@@ -481,22 +489,56 @@ module KrikriAwsSsm
                            shared : SharedConfig) : {String, String, String, String, String?}?
       account_id = profile["sso_account_id"]?
       role_name = profile["sso_role_name"]?
-      return unless account_id && role_name
+      # Botocore only treats a profile as SSO when one of its two mandatory
+      # keys is present; a profile with neither is left to the other providers.
+      return if account_id.nil? && role_name.nil?
 
       session_name = profile["sso_session"]?
-      session = session_name ? shared.sso_session(session_name) : nil
-      if session_name && session.nil?
-        raise CredentialsError.new(
-          "The sso-session \"#{session_name}\" referenced by profile \"#{name}\" does not exist")
-      end
+      session = sso_session(name, session_name, shared)
+      reject_conflicting_sso_keys(profile, session)
 
       start_url = session.try { |value| value["sso_start_url"]? } || profile["sso_start_url"]?
       region = sso_region(session, profile)
-      unless start_url
+      missing = missing_sso_keys(account_id, role_name, start_url)
+      unless missing.empty?
         raise CredentialsError.new(
-          "The profile \"#{name}\" is configured to use SSO but is missing sso_start_url")
+          "The profile \"#{name}\" is configured to use SSO but is missing required " \
+          "configuration: #{missing.join(", ")}")
       end
-      {start_url, region, account_id, role_name, session_name}
+      # The nil checks in missing_sso_keys prove these are present.
+      {start_url.as(String), region, account_id.as(String), role_name.as(String), session_name}
+    end
+
+    private def sso_session(name : String, session_name : String?,
+                            shared : SharedConfig) : Hash(String, String)?
+      return unless session_name
+      session = shared.sso_session(session_name)
+      return session if session
+      raise CredentialsError.new(
+        "The sso-session \"#{session_name}\" referenced by profile \"#{name}\" does not exist")
+    end
+
+    # A key present in both places must agree; silently preferring the
+    # sso-session block hid a misconfiguration botocore rejects.
+    private def reject_conflicting_sso_keys(profile : Hash(String, String),
+                                            session : Hash(String, String)?) : Nil
+      return unless session
+      session.each do |key, value|
+        if (profile_value = profile[key]?) && profile_value != value
+          raise CredentialsError.new(
+            "The value for #{key} is inconsistent between profile (#{profile_value}) " \
+            "and sso-session (#{value})")
+        end
+      end
+    end
+
+    private def missing_sso_keys(account_id : String?, role_name : String?,
+                                 start_url : String?) : Array(String)
+      missing = [] of String
+      missing << "sso_account_id" unless account_id
+      missing << "sso_role_name" unless role_name
+      missing << "sso_start_url" unless start_url
+      missing
     end
 
     private def sso_region(session : Hash(String, String)?,
@@ -550,7 +592,8 @@ module KrikriAwsSsm
     end
 
     private def shared_config : SharedConfig
-      SharedConfig.load(@config.shared_config_file, @config.shared_credentials_file)
+      @shared_config_cache ||= SharedConfig.load(@config.shared_config_file,
+        @config.shared_credentials_file)
     end
 
     private def cycle_error(profile : String, visited : Array(String)) : CredentialsError

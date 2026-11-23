@@ -17,6 +17,7 @@ module KrikriAwsSsm
       # botocore's own budget (2 s, 3 attempts) instead of the IMDS one.
       DEFAULT_CONTAINER_TIMEOUT       = 2.seconds
       DEFAULT_CONTAINER_ATTEMPTS      = 3
+      DEFAULT_CONTAINER_RETRY_DELAY   = 1.second
       DEFAULT_SERVICE_CONNECT_TIMEOUT = 10.seconds
       DEFAULT_SERVICE_READ_TIMEOUT    = 60.seconds
       DEFAULT_PROCESS_TIMEOUT         = 60.seconds
@@ -43,9 +44,10 @@ module KrikriAwsSsm
       # Metadata endpoints (IMDS/ECS) use short timeouts; STS/SSO are
       # internet calls and must not inherit the 250 ms metadata budget.
       property connect_timeout : Time::Span
-      # Container credentials: their own timeout and attempt count.
+      # Container credentials: their own timeout, attempt count and backoff.
       property container_timeout : Time::Span
       property container_attempts : Int32
+      property container_retry_delay : Time::Span
       property read_timeout : Time::Span
       property service_connect_timeout : Time::Span
       property service_read_timeout : Time::Span
@@ -91,6 +93,7 @@ module KrikriAwsSsm
                      connect_timeout : Time::Span = DEFAULT_METADATA_TIMEOUT,
                      container_timeout : Time::Span = DEFAULT_CONTAINER_TIMEOUT,
                      container_attempts : Int32 = DEFAULT_CONTAINER_ATTEMPTS,
+                     container_retry_delay : Time::Span = DEFAULT_CONTAINER_RETRY_DELAY,
                      read_timeout : Time::Span = DEFAULT_METADATA_TIMEOUT,
                      service_connect_timeout : Time::Span = DEFAULT_SERVICE_CONNECT_TIMEOUT,
                      service_read_timeout : Time::Span = DEFAULT_SERVICE_READ_TIMEOUT,
@@ -124,6 +127,7 @@ module KrikriAwsSsm
         @connect_timeout = connect_timeout
         @container_timeout = container_timeout
         @container_attempts = container_attempts
+        @container_retry_delay = container_retry_delay
         @read_timeout = read_timeout
         @service_connect_timeout = service_connect_timeout
         @service_read_timeout = service_read_timeout

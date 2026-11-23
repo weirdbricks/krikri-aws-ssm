@@ -54,6 +54,7 @@ module KrikriAwsSsm
 
     def generate_data_key(key_id : String, session_id : String, target_id : String) : DataKey
       response = @aws_json.call("GenerateDataKey", request_body(key_id, session_id, target_id))
+      validate_key_id(response)
       plaintext = decode_bytes(response, "Plaintext")
       ciphertext_blob = decode_bytes(response, "CiphertextBlob")
       unless plaintext.size == KEY_SIZE_BYTES
@@ -76,6 +77,15 @@ module KrikriAwsSsm
           end
         end
       end
+    end
+
+    # `KeyId` is informational (botocore does not compare it with the
+    # request), but a non-string value means the response is not what it
+    # claims to be, so it is rejected rather than ignored.
+    private def validate_key_id(response : JSON::Any) : Nil
+      key_id = response.as_h?.try(&.["KeyId"]?)
+      return if key_id.nil? || key_id.as_s?
+      raise ProtocolError.new("KMS response KeyId is not a string")
     end
 
     private def decode_bytes(response : JSON::Any, field : String) : Bytes

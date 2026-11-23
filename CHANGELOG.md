@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.1 (2026-11-22)
+
+Follow-up to 0.4.0, closing the remaining review items.
+
+- Ping failures now close the session as `NetworkLost` instead of waiting for
+  the idle deadline; the handshake request is processed off the reader fiber
+  so a slow `GenerateDataKey` does not stop acknowledgements/pings, and an
+  already-owned output payload is no longer copied a second time.
+- `Message#payload_digest` always reflects the current payload, and `encode`
+  rejects a message type that decode would not reproduce (NUL or edge
+  whitespace). Decode-only handshake structs now emit nulls like the
+  reference.
+- KMS rejects a non-string `KeyId`; SSO rejects a key that disagrees between
+  a profile and its `sso-session` and names the keys missing from a
+  half-configured SSO profile; the shared config is parsed once per chain
+  (botocore session semantics); IMDS reuses one keep-alive client for its
+  token and GETs; container retries use a configurable backoff.
+- The fake gateway verifies presigned upgrades (signature present, no
+  Authorization), verifies SigV4 in a configurable region, and its request
+  channels no longer stall a busy spec. Specs close the remaining gaps:
+  expiry boundaries, cache hits, resume output delivery, concurrent state
+  reads, KMS base64/KeyId failures and container retries.
+
 ## 0.4.0 (2026-11-22)
 
 Review hardening (no public API removals).

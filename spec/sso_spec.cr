@@ -184,6 +184,41 @@ describe KrikriAwsSsm::CredentialChain::Sso do
     end
   end
 
+  it "rejects a key that differs between the profile and its sso-session" do
+    CredentialSpecHelper.with_temp_dir do |dir|
+      CredentialSpecHelper.write(File.join(dir, "config"), <<-INI)
+        [sso-session my-sso]
+        sso_start_url = https://example.awsapps.com/start
+        sso_region = us-east-1
+
+        [profile sso]
+        sso_session = my-sso
+        sso_start_url = https://other.awsapps.com/start
+        sso_account_id = 123456789012
+        sso_role_name = MyRole
+        INI
+      chain = CredentialSpecHelper.chain({"AWS_EC2_METADATA_DISABLED" => "true"}, dir)
+      error = assert_raises(KrikriAwsSsm::CredentialsError) { chain.resolve("sso") }
+      assert_includes error.message.to_s, "inconsistent between profile"
+      assert_includes error.message.to_s, "sso_start_url"
+    end
+  end
+
+  it "names the missing required keys of a half-configured SSO profile" do
+    CredentialSpecHelper.with_temp_dir do |dir|
+      CredentialSpecHelper.write(File.join(dir, "config"), <<-INI)
+        [profile sso]
+        sso_start_url = https://example.awsapps.com/start
+        sso_region = us-east-1
+        sso_role_name = MyRole
+        INI
+      chain = CredentialSpecHelper.chain({"AWS_EC2_METADATA_DISABLED" => "true"}, dir)
+      error = assert_raises(KrikriAwsSsm::CredentialsError) { chain.resolve("sso") }
+      assert_includes error.message.to_s, "missing required configuration"
+      assert_includes error.message.to_s, "sso_account_id"
+    end
+  end
+
   it "reports the login error when the token refresh is refused" do
     transport = ->(_request : HTTP::Request, endpoint : URI) do
       if endpoint.host.try(&.starts_with?("oidc."))

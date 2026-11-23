@@ -393,6 +393,19 @@ describe KrikriAwsSsm::CredentialChain do
     assert_equal "Unable to locate credentials", error.message
   end
 
+  it "serves a second resolve from the cache without another provider call" do
+    calls = 0
+    chain = KrikriAwsSsm::CredentialChain.new([
+      ->(_profile : String?) do
+        calls += 1
+        KrikriAwsSsm::Credentials.new("KEY", "SECRET").as(KrikriAwsSsm::Credentials?)
+      end,
+    ])
+    assert_equal "KEY", chain.resolve.access_key
+    assert_equal "KEY", chain.resolve.access_key
+    assert_equal 1, calls
+  end
+
   it "marks credentials near expiry for refresh" do
     expiring = KrikriAwsSsm::Credentials.new("A", "B", expires_at: Time.utc + 2.minutes)
     assert expiring.refresh_needed?

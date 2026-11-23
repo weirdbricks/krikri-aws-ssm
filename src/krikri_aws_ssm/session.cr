@@ -451,15 +451,29 @@ module KrikriAwsSsm
         # fibers can interleave frame fragments on the wire. Re-check the
         # generation and take the socket under the state lock: `resume` may
         # have replaced it.
-        quietly do
-          @send_mutex.synchronize do
-            ws, current = @state_mutex.synchronize do
-              {@ws, !@closed && @generation == generation}
-            end
-            ws.ping if ws && current
-          end
+        if error = send_ping(generation)
+          # A failed ping is a dead write half: close now instead of waiting
+          # out the idle deadline on a half-open socket.
+          close!(CloseReason::NetworkLost, error, generation)
+          break
         end
       end
+    end
+
+    # Sends one websocket ping under the send lock; returns the IO error (the
+    # write half is gone) or nil. The failure is returned rather than raised
+    # so the ping loop can close and exit without a rescue in its body.
+    private def send_ping(generation : Int32) : Exception?
+      @send_mutex.synchronize do
+        ws, current = @state_mutex.synchronize do
+          {@ws, !@closed && @generation == generation}
+        end
+        return unless ws && current
+        ws.ping
+      end
+      nil
+    rescue ex : IO::Error
+      ex
     end
 
     private def liveness_loop(generation : Int32) : Nil
@@ -532,10 +546,15 @@ module KrikriAwsSsm
         mark_progress
         @state_mutex.synchronize { @gap_since = nil } if @inbound.buffered.zero?
         acceptance.items.each do |item|
-          # The reference processes a frame's handler before acknowledging it,
-          # handshake payloads included.
-          deliver(item, generation)
-          acknowledge(item, generation)
+          if item.payload_type == PayloadType::HandshakeRequest.value
+            # The handshake handler can block on the KMS GenerateDataKey round
+            # trip; run it off the reader so ping/ack/liveness frames keep
+            # being consumed. The frame is still processed before it is acked.
+            deliver_handshake(item, generation)
+          else
+            deliver(item, generation)
+            acknowledge(item, generation)
+          end
         end
       when InboundSequencer::Disposition::Buffered
         # Buffered frames are acked (there is no other backpressure), so the
@@ -556,6 +575,15 @@ module KrikriAwsSsm
 
     private def mark_progress : Nil
       @state_mutex.synchronize { @last_progress = Time.instant }
+    end
+
+    private def deliver_handshake(message : Message, generation : Int32) : Nil
+      deliver(message, generation)
+      acknowledge(message, generation)
+    rescue ChannelClosed
+      # The session closed while the handshake was being processed.
+    rescue ex : Exception
+      close!(CloseReason::ProtocolError, ex, generation)
     end
 
     private def deliver(message : Message, generation : Int32) : Nil
@@ -646,7 +674,10 @@ module KrikriAwsSsm
         if @output_finished
           false
         else
-          @output << Output.new(stream, bytes.dup)
+          # The payload is an owned buffer (Message.decode copies it, and a
+          # decrypted payload is freshly allocated), so it is not copied again
+          # on the reader's hot path.
+          @output << Output.new(stream, bytes)
           @output_bytes += bytes.size
           overflow = @output_bytes > @settings.output_buffer_limit
           true

@@ -79,6 +79,28 @@ describe KrikriAwsSsm::Kms do
     end
   end
 
+  it "rejects a non-string KeyId in the response" do
+    server = TestHttpServer.new do |_request|
+      TestHttpResponse.new(200, JSON.build do |json|
+        json.object do
+          json.field "Plaintext", Base64.strict_encode(KmsSpecData::PLAINTEXT)
+          json.field "CiphertextBlob", Base64.strict_encode(KmsSpecData::CIPHERTEXT_BLOB)
+          json.field "KeyId", 5
+        end
+      end)
+    end
+    begin
+      kms = KrikriAwsSsm::Kms.new(KmsSpecData::CREDS, "us-east-1",
+        endpoint_url: server.url, allow_insecure_endpoint: true)
+      error = assert_raises(KrikriAwsSsm::ProtocolError) do
+        kms.generate_data_key("key-1", "s-123", "i-456")
+      end
+      assert_equal "KMS response KeyId is not a string", error.message
+    ensure
+      server.close
+    end
+  end
+
   it "re-signs each call with the current credentials from a provider" do
     calls = 0
     provider = -> do
@@ -102,6 +124,27 @@ describe KrikriAwsSsm::Kms do
       first = server.next_request.headers["Authorization"].split("Credential=")[1].split('/').first
       second = server.next_request.headers["Authorization"].split("Credential=")[1].split('/').first
       refute_equal first, second
+    ensure
+      server.close
+    end
+  end
+
+  it "rejects a data key that is not valid base64" do
+    server = TestHttpServer.new do |_request|
+      TestHttpResponse.new(200, JSON.build do |json|
+        json.object do
+          json.field "Plaintext", "not base64!"
+          json.field "CiphertextBlob", Base64.strict_encode(KmsSpecData::CIPHERTEXT_BLOB)
+        end
+      end)
+    end
+    begin
+      kms = KrikriAwsSsm::Kms.new(KmsSpecData::CREDS, "us-east-1",
+        endpoint_url: server.url, allow_insecure_endpoint: true)
+      error = assert_raises(KrikriAwsSsm::ProtocolError) do
+        kms.generate_data_key("key-1", "s-123", "i-456")
+      end
+      assert_includes error.message.to_s, "not valid base64"
     ensure
       server.close
     end

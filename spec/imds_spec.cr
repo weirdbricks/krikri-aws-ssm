@@ -305,6 +305,24 @@ describe KrikriAwsSsm::CredentialChain::Ecs do
     end
   end
 
+  it "retries a failed container request with its own backoff" do
+    attempts = 0
+    transport = ->(_request : HTTP::Request, _endpoint : URI) do
+      attempts += 1
+      raise IO::Error.new("connection reset") if attempts < 3
+      HTTP::Client::Response.new(200, CredentialSpecHelper.metadata_response)
+    end
+    CredentialSpecHelper.with_temp_dir do |_dir|
+      config = KrikriAwsSsm::CredentialChain::Config.new(
+        env: {"AWS_CONTAINER_CREDENTIALS_FULL_URI" => "http://127.0.0.1:1/full/credentials"},
+        transport: transport,
+        container_retry_delay: 1.millisecond)
+      credentials = KrikriAwsSsm::CredentialChain.new(config).resolve
+      assert_equal "METAKEY", credentials.access_key
+      assert_equal 3, attempts
+    end
+  end
+
   it "rejects an insecure non-loopback full URI unless explicitly allowed" do
     CredentialSpecHelper.with_temp_dir do |dir|
       env = {"AWS_CONTAINER_CREDENTIALS_FULL_URI" => "http://10.0.0.1/creds"}

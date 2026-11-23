@@ -28,30 +28,47 @@ module KrikriAwsSsm
 
       def credentials : Credentials?
         endpoint = URI.parse(@config.imds_endpoint)
-        token = session_token(endpoint)
-        return if token.nil? && @config.imds_v1_disabled?
+        # One keep-alive client for the token + two GETs when the real HTTP
+        # client is used; the injected transport seam gets one call per
+        # request as before.
+        client = metadata_client(endpoint)
+        begin
+          token = session_token(endpoint, client)
+          return if token.nil? && @config.imds_v1_disabled?
 
-        role = role_name(endpoint, token)
-        return unless role
+          role = role_name(endpoint, token, client)
+          return unless role
 
-        read_credentials(endpoint, token, role)
+          read_credentials(endpoint, token, role, client)
+        ensure
+          client.try(&.close)
+        end
       rescue IO::Error
         nil
       end
 
-      private def session_token(endpoint : URI) : String?
+      private def metadata_client(endpoint : URI) : HTTP::Client?
+        return if @config.imds_transport_or_default
+        client = HTTP::Client.new(endpoint)
+        client.connect_timeout = @config.connect_timeout
+        client.read_timeout = @config.read_timeout
+        client
+      end
+
+      private def session_token(endpoint : URI, client : HTTP::Client?) : String?
         headers = HTTP::Headers{
           "Host"           => HTTPTransport.authority(endpoint),
           TOKEN_TTL_HEADER => TOKEN_TTL,
         }
-        response = perform("PUT", endpoint, path(endpoint, TOKEN_PATH), headers)
+        response = perform("PUT", endpoint, path(endpoint, TOKEN_PATH), headers, client)
         return unless response.success?
         token = response.body.strip
         token.empty? ? nil : token
       end
 
-      private def role_name(endpoint : URI, token : String?) : String?
-        response = perform("GET", endpoint, path(endpoint, ROLE_PATH), token_headers(endpoint, token))
+      private def role_name(endpoint : URI, token : String?, client : HTTP::Client?) : String?
+        response = perform("GET", endpoint, path(endpoint, ROLE_PATH),
+          token_headers(endpoint, token), client)
         return unless response.success?
         response.body.each_line do |line|
           name = line.strip
@@ -60,9 +77,10 @@ module KrikriAwsSsm
         nil
       end
 
-      private def read_credentials(endpoint : URI, token : String?, role : String) : Credentials?
+      private def read_credentials(endpoint : URI, token : String?, role : String,
+                                   client : HTTP::Client?) : Credentials?
         response = perform("GET", endpoint, path(endpoint, "#{ROLE_PATH}#{role}"),
-          token_headers(endpoint, token))
+          token_headers(endpoint, token), client)
         return unless response.success?
 
         json = JSON.parse(response.body).as_h?
@@ -86,19 +104,30 @@ module KrikriAwsSsm
       end
 
       private def perform(method : String, endpoint : URI, resource : String,
-                          headers : HTTP::Headers) : HTTP::Client::Response
+                          headers : HTTP::Headers,
+                          client : HTTP::Client?) : HTTP::Client::Response
         attempts = @config.imds_attempts
         attempt = 0
         loop do
           attempt += 1
           begin
             request = HTTP::Request.new(method, resource, headers)
-            return HTTPTransport.perform(request, endpoint, @config.imds_transport_or_default,
-              @config.connect_timeout, @config.read_timeout)
+            return exec(request, endpoint, client)
           rescue ex : IO::Error
             raise ex if attempt >= attempts
           end
         end
+      end
+
+      private def exec(request : HTTP::Request, endpoint : URI,
+                       client : HTTP::Client?) : HTTP::Client::Response
+        if client
+          response = client.exec(request)
+          return HTTP::Client::Response.new(response.status_code, response.body,
+            response.headers, response.status_message)
+        end
+        HTTPTransport.perform(request, endpoint, @config.imds_transport_or_default,
+          @config.connect_timeout, @config.read_timeout)
       end
 
       private def path(endpoint : URI, suffix : String) : String

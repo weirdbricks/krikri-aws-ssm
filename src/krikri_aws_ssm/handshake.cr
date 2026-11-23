@@ -6,6 +6,7 @@ module KrikriAwsSsm
   # `src/message/handshakemessage.go` (client) and the agent's
   # `agent/session/contracts/model.go`.
   module Handshake
+    @[JSON::Serializable::Options(emit_nulls: true)]
     struct RequestedClientAction
       include JSON::Serializable
 
@@ -85,6 +86,7 @@ module KrikriAwsSsm
       getter customer_message : String?
     end
 
+    @[JSON::Serializable::Options(emit_nulls: true)]
     struct SessionTypeRequest
       include JSON::Serializable
 
@@ -98,6 +100,7 @@ module KrikriAwsSsm
       end
     end
 
+    @[JSON::Serializable::Options(emit_nulls: true)]
     struct KMSEncryptionRequest
       include JSON::Serializable
 
