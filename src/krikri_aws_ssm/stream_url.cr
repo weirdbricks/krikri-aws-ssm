@@ -18,7 +18,9 @@ module KrikriAwsSsm
     def parse(raw : String) : URI
       uri = URI.parse(raw)
       raise ProtocolError.new("StreamUrl has no scheme") unless uri.scheme
-      raise ProtocolError.new("StreamUrl has no host") unless uri.host
+      host = uri.host
+      # `wss:///path` parses with an empty (not nil) host.
+      raise ProtocolError.new("StreamUrl has no host") if host.nil? || host.empty?
       raise ProtocolError.new("StreamUrl must not carry userinfo") if uri.user
       uri
     rescue ex : URI::Error

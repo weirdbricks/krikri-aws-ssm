@@ -252,6 +252,19 @@ describe KrikriAwsSsm::StreamUrl do
     assert_equal "host:8443", KrikriAwsSsm::StreamUrl.authority(uri)
   end
 
+  it "rejects malformed StreamUrls at parse time" do
+    [
+      "//host/path",               # no scheme
+      "wss:///path",               # no host
+      "wss://user:pass@host/path", # userinfo
+      "wss://host:notaport/path",  # invalid port
+    ].each do |raw|
+      assert_raises(KrikriAwsSsm::ProtocolError, raw) do
+        KrikriAwsSsm::StreamUrl.parse(raw)
+      end
+    end
+  end
+
   it "accepts a wss URL on an AWS host" do
     uri = KrikriAwsSsm::StreamUrl.parse("wss://ssmmessages.us-east-1.amazonaws.com/v1/data-channel/s")
     KrikriAwsSsm::StreamUrl.validate!(uri, false)

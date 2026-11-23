@@ -5,10 +5,12 @@
 - Distinguish a GCM authentication failure from a cipher setup failure in
   `Encrypter#decrypt`, so a provider/configuration error is not reported as
   "failed authentication".
+- Reject a `StreamUrl` whose host is empty (`wss:///path` parses with `""`,
+  not nil), which slipped past the no-host check.
 - Specs: an empty-payload encryption round trip, a black-holed connect that
   must become a `HandshakeFailed` within the budget, concurrent
-  `Client#credentials` callers resolving once, and the container timeout
-  applied to a slow remote `FULL_URI`.
+  `Client#credentials` callers resolving once, the container timeout applied
+  to a slow remote `FULL_URI`, and the `StreamUrl` parse rejections.
 
 ## 0.4.1 (2026-11-22)
 
