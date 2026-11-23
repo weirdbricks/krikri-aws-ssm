@@ -6,13 +6,6 @@ data-channel protocol itself, so the controller needs **no AWS CLI** and **no
 `session-manager-plugin`** - only the SSM agent on the target and the usual AWS
 permissions.
 
-Status: implemented and live-validated (wire protocol and session core, fake
-harness, control plane, KMS encryption, credential chain, the krikri SSM
-transport and its test matrix, and the docs). `synchronize:` push and pull run
-through the session as well (live-verified, issue #1694). See `CHANGELOG.md`
-for the release history and `docs/protocol.md` for the wire format and the
-design notes it is built from.
-
 ## What it does
 
 - `ssm:StartSession` / `ResumeSession` / `TerminateSession`, SigV4-signed
