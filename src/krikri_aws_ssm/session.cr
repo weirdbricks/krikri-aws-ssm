@@ -318,7 +318,7 @@ module KrikriAwsSsm
         @generation
       end
       ws.on_binary { |bytes| handle_frame(bytes, generation) }
-      ws.on_close { |_code, _message| close!(CloseReason::NetworkLost) if current?(generation) }
+      ws.on_close { |_code, _message| close!(CloseReason::NetworkLost, generation: generation) }
       spawn { read_loop(ws, generation) }
       spawn { retransmit_loop(generation) }
       spawn { ping_loop(generation) }
@@ -550,7 +550,7 @@ module KrikriAwsSsm
             # The handshake handler can block on the KMS GenerateDataKey round
             # trip; run it off the reader so ping/ack/liveness frames keep
             # being consumed. The frame is still processed before it is acked.
-            deliver_handshake(item, generation)
+            spawn deliver_handshake(item, generation)
           else
             deliver(item, generation)
             acknowledge(item, generation)
@@ -594,9 +594,9 @@ module KrikriAwsSsm
         complete_handshake
       when PayloadType::Output.value
         complete_handshake if !handshake_complete? && session_type.nil?
-        emit(Stream::Stdout, payload_bytes(message))
+        emit(Stream::Stdout, payload_bytes(message), generation)
       when PayloadType::StdErr.value
-        emit(Stream::Stderr, payload_bytes(message))
+        emit(Stream::Stderr, payload_bytes(message), generation)
       when PayloadType::ExitCode.value
         code = parse_exit_code(payload_bytes(message))
         @state_mutex.synchronize { @exit_code = code }
@@ -667,7 +667,7 @@ module KrikriAwsSsm
     # Never blocks: the websocket reader has to keep consuming frames even
     # when the caller is not draining output. Memory is capped by
     # `Settings#output_buffer_limit`.
-    private def emit(stream : Stream, bytes : Bytes) : Nil
+    private def emit(stream : Stream, bytes : Bytes, generation : Int32? = nil) : Nil
       return if bytes.empty? || closed?
       overflow = false
       added = @output_mutex.synchronize do
@@ -687,7 +687,7 @@ module KrikriAwsSsm
       if overflow
         record_error(OutputBufferExceeded.new(
           "unread session output exceeded #{@settings.output_buffer_limit} bytes"))
-        close!(CloseReason::ProtocolError)
+        close!(CloseReason::ProtocolError, generation: generation)
         return
       end
       # `close!` may close the signal between the guard above and this send.
@@ -838,6 +838,9 @@ module KrikriAwsSsm
     # --- outbound ----------------------------------------------------------
 
     private def send_input(payload_type : UInt32, payload : Bytes) : Nil
+      # Pin the frame to the connection this caller wrote for: a send that
+      # overlaps `resume` must fail rather than land on the new websocket.
+      generation = @state_mutex.synchronize { @generation }
       @write_mutex.synchronize do
         raise_closed if closed?
         if payload_type == PayloadType::Output.value
@@ -858,7 +861,7 @@ module KrikriAwsSsm
         # entry back when the send fails.
         @reliability.track(sequence, frame)
         begin
-          send_raw(frame)
+          send_raw(frame, generation)
         rescue ex
           @reliability.untrack(sequence)
           raise ex

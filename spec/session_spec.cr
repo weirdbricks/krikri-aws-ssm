@@ -1044,6 +1044,37 @@ describe "KrikriAwsSsm::Session KMS encryption" do
     end
   end
 
+  it "answers control frames while GenerateDataKey is in flight" do
+    options = SessionSpecData.quiet_agent_options
+    options.kms_key_id = "key-1"
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS, options)
+    gate = Channel(Nil).new
+    gateway.kms_gate = gate
+    begin
+      opened = Channel(KrikriAwsSsm::Session).new(1)
+      spawn do
+        opened.send(KrikriAwsSsm::Session.open(
+          SessionSpecData.settings(gateway, kms_endpoint_url: gateway.url)))
+      end
+      agent = receive_with_timeout(gateway.agents)
+      # The gateway holds the GenerateDataKey reply until the spec releases it.
+      receive_with_timeout(gate)
+      agent.send_ping
+      ponged = wait_until(2.seconds) { agent.pongs.get > 0 }
+      gate.send(nil)
+      session = receive_with_timeout(opened)
+      begin
+        assert ponged,
+          "the reader did not answer a ping while GenerateDataKey was in flight"
+        assert session.encryption_enabled?
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
   it "fails the handshake on a non-object encryption challenge payload" do
     options = SessionSpecData.quiet_agent_options
     options.kms_key_id = "key-1"

@@ -54,7 +54,8 @@ module KrikriAwsSsm
                (allow_loopback_http && scheme == "http" && allowed_metadata_http?(host))
           raise ConfigurationError.new(
             "#{service} endpoint #{url} must use https " \
-            "(http is only allowed for a loopback address or with allow_insecure_endpoint)")
+            "(http is only allowed for a container metadata address or with " \
+            "allow_insecure_endpoint)")
         end
         uri
       end

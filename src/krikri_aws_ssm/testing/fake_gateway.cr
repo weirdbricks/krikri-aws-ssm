@@ -28,6 +28,10 @@ module KrikriAwsSsm::Testing
     # Replaces the data-channel URL in StartSession/ResumeSession, so a spec
     # can point the client at a non-responding peer.
     property stream_url_override : String? = nil
+    # When set, a KMS request signals on this channel and then waits for a
+    # value before it answers, so a spec can hold GenerateDataKey open and
+    # observe what the client does meanwhile.
+    property kms_gate : Channel(Nil)? = nil
 
     # Capacities are generous: a handler blocks the server fiber on `send`
     # once a channel is full, so a busy spec must not stall the fake gateway.
@@ -144,6 +148,10 @@ module KrikriAwsSsm::Testing
       request = context.request
       captured = HTTP::Request.new(request.method, request.resource, request.headers, body)
       @kms_requests.send(captured)
+      if gate = @kms_gate
+        gate.send(nil)
+        gate.receive
+      end
       unless action == "GenerateDataKey"
         respond(context, 400,
           %({"__type":"InvalidAction","message":"unsupported KMS action #{action}"}))

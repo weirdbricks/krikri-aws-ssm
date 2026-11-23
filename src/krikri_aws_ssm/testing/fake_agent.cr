@@ -41,6 +41,10 @@ module KrikriAwsSsm::Testing
     getter received_input = Channel(Bytes).new(1024)
     getter challenge_responses = Channel(Bytes).new(4)
     getter pings = Atomic(Int32).new(0)
+    # Pongs the client sent in answer to this agent's pings. A client whose
+    # reader is busy elsewhere cannot answer, so a spec can use it as a
+    # liveness probe while a handshake action is in flight.
+    getter pongs = Atomic(Int32).new(0)
     # Output frames handed to the socket. Specs use it as a barrier instead of
     # sleeping when they need the client to have buffered output.
     getter outputs_sent = Atomic(Int32).new(0)
@@ -69,11 +73,16 @@ module KrikriAwsSsm::Testing
 
     def run : Nil
       @ws.on_ping { @pings.add(1) }
+      @ws.on_pong { @pongs.add(1) }
       @ws.on_message { |text| handle_text(text) }
       @ws.on_binary { |bytes| handle_binary(bytes) }
       @ws.run
     ensure
       stop
+    end
+
+    def send_ping : Nil
+      @ws.ping
     end
 
     # --- frames the client should handle ----------------------------------
