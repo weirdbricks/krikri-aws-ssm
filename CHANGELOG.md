@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.0 (2026-11-22)
+
+First stable release, and the point from which the public API follows semver.
+
+- Includes the 0.4.x hardening (no tag was cut for those versions): redacted
+  `inspect` on every secret-bearing struct, typed errors for malformed JSON and
+  oversized frames, bounded dials and credential refreshes, generation-guarded
+  resume, progress-based liveness, the KMS/GCM fix, and the credential-chain
+  parity work.
+- The supported surface is `Settings`, `Session`, `Message`, `StreamUrl`, the
+  credential chain and `require "krikri-aws-ssm/testing"`. Protocol framing,
+  message types and timers stay pinned to the Apache-2.0 reference
+  implementations and are documented in `docs/protocol.md`.
+
 ## 0.4.2 (2026-11-22)
 
 - Distinguish a GCM authentication failure from a cipher setup failure in
