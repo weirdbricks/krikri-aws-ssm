@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.2 (2026-11-22)
+
+- Distinguish a GCM authentication failure from a cipher setup failure in
+  `Encrypter#decrypt`, so a provider/configuration error is not reported as
+  "failed authentication".
+- Specs: an empty-payload encryption round trip, a black-holed connect that
+  must become a `HandshakeFailed` within the budget, concurrent
+  `Client#credentials` callers resolving once, and the container timeout
+  applied to a slow remote `FULL_URI`.
+
 ## 0.4.1 (2026-11-22)
 
 Follow-up to 0.4.0, closing the remaining review items.

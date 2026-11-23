@@ -305,6 +305,29 @@ describe KrikriAwsSsm::CredentialChain::Ecs do
     end
   end
 
+  it "applies the container timeout to a slow remote response" do
+    server = TestHttpServer.new do |_request|
+      sleep 1.second
+      TestHttpResponse.new(200, CredentialSpecHelper.metadata_response)
+    end
+    begin
+      CredentialSpecHelper.with_temp_dir do |_dir|
+        config = KrikriAwsSsm::CredentialChain::Config.new(
+          env: {"AWS_CONTAINER_CREDENTIALS_FULL_URI" => "#{server.url}/full/credentials"},
+          container_timeout: 200.milliseconds,
+          container_attempts: 1)
+        started = Time.instant
+        error = assert_raises(KrikriAwsSsm::CredentialsError) do
+          KrikriAwsSsm::CredentialChain.new(config).resolve
+        end
+        assert_includes error.message.to_s, "could not be retrieved"
+        assert Time.instant - started < 3.seconds
+      end
+    ensure
+      server.close
+    end
+  end
+
   it "retries a failed container request with its own backoff" do
     attempts = 0
     transport = ->(_request : HTTP::Request, _endpoint : URI) do

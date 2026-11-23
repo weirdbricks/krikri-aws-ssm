@@ -46,6 +46,25 @@ describe KrikriAwsSsm::Encrypter do
     assert_raises(KrikriAwsSsm::ProtocolError) { encrypter.decrypt(ciphertext) }
   end
 
+  it "round-trips an empty payload through nonce and tag" do
+    key = Bytes.new(64, &.to_u8)
+    encrypter = KrikriAwsSsm::Encrypter.new(key)
+    peer = KrikriAwsSsm::Encrypter.new(key[32, 32] + key[0, 32])
+    ciphertext = encrypter.encrypt(Bytes.empty)
+    assert_equal KrikriAwsSsm::Encrypter::NONCE_SIZE + KrikriAwsSsm::Encrypter::TAG_SIZE,
+      ciphertext.size
+    assert_empty peer.decrypt(ciphertext)
+  end
+
+  it "reports a wrong-key failure as an authentication failure" do
+    first = KrikriAwsSsm::Encrypter.new(Bytes.new(64, &.to_u8))
+    second = KrikriAwsSsm::Encrypter.new(Bytes.new(64) { |index| (index + 9).to_u8 })
+    error = assert_raises(KrikriAwsSsm::ProtocolError) do
+      second.decrypt(first.encrypt("secret".to_slice))
+    end
+    assert_includes error.message.to_s, "failed authentication"
+  end
+
   it "rejects a payload encrypted under another key" do
     first = KrikriAwsSsm::Encrypter.new(Bytes.new(64, &.to_u8))
     second = KrikriAwsSsm::Encrypter.new(Bytes.new(64) { |index| (index + 7).to_u8 })

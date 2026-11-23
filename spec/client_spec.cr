@@ -393,6 +393,23 @@ describe KrikriAwsSsm::CredentialChain do
     assert_equal "Unable to locate credentials", error.message
   end
 
+  it "resolves credentials once for concurrent callers" do
+    calls = 0
+    chain = KrikriAwsSsm::CredentialChain.new([
+      ->(_profile : String?) do
+        calls += 1
+        KrikriAwsSsm::Credentials.new("KEY", "SECRET").as(KrikriAwsSsm::Credentials?)
+      end,
+    ])
+    settings = KrikriAwsSsm::Settings.new("i-0123456789")
+    client = KrikriAwsSsm::Client.new(settings, chain)
+
+    results = Channel(KrikriAwsSsm::Credentials).new(4)
+    4.times { spawn { results.send(client.credentials) } }
+    4.times { assert_equal "KEY", receive_with_timeout(results).access_key }
+    assert_equal 1, calls
+  end
+
   it "serves a second resolve from the cache without another provider call" do
     calls = 0
     chain = KrikriAwsSsm::CredentialChain.new([

@@ -49,8 +49,15 @@ module KrikriAwsSsm
       nonce = ciphertext[0, NONCE_SIZE]
       tag = ciphertext[ciphertext.size - TAG_SIZE, TAG_SIZE]
       body = ciphertext[NONCE_SIZE, ciphertext.size - NONCE_SIZE - TAG_SIZE]
-      cipher = cipher(:decrypt, @decryption_key, nonce)
-      cipher.gcm_tag = tag
+      # Setup failures (bad key/iv/tag length) are not authentication
+      # failures; once the tag is set, an error can only be the tag check.
+      cipher = begin
+        instance = cipher(:decrypt, @decryption_key, nonce)
+        instance.gcm_tag = tag
+        instance
+      rescue ex : OpenSSL::Cipher::Error
+        raise ProtocolError.new("failed to decrypt payload: #{ex.message}")
+      end
       update_and_final(cipher, body)
     rescue ex : OpenSSL::Cipher::Error
       raise ProtocolError.new("encrypted payload failed authentication: #{ex.message}")

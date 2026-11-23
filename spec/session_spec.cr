@@ -59,6 +59,26 @@ describe KrikriAwsSsm::Session do
     assert_includes text, "s-1"
   end
 
+  it "wraps a black-holed connect as a HandshakeFailed within the budget" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS,
+      SessionSpecData.quiet_agent_options)
+    gateway.stream_url_override = "ws://10.255.255.1:81/data-channel/s-fake-1"
+    settings = KrikriAwsSsm::Settings.new("i-0123456789",
+      endpoint_url: gateway.url, allow_insecure_endpoint: true,
+      credentials: SessionSpecData::CREDS, connect_timeout: 200.milliseconds,
+      read_timeout: 200.milliseconds)
+    begin
+      started = Time.instant
+      error = assert_raises(KrikriAwsSsm::HandshakeFailed) do
+        KrikriAwsSsm::Session.open(settings)
+      end
+      assert_includes error.message.to_s, "failed to open data channel"
+      assert Time.instant - started < 3.seconds
+    ensure
+      gateway.close
+    end
+  end
+
   it "bounds the data-channel upgrade read by the read timeout" do
     listener = TCPServer.new("127.0.0.1", 0)
     gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS,
