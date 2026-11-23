@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.1 (2026-11-22)
+
+- Depend on `krikri-aws-signer` v1.0.0 instead of v0.3.0, so consumers get the
+  signer's stable 1.x API alongside this shard's stable 1.0 API.
+
 ## 1.0.0 (2026-11-22)
 
 First stable release, and the point from which the public API follows semver.
