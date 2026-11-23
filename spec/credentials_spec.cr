@@ -11,6 +11,21 @@ private class FakeTty < IO::Memory
   end
 end
 
+# A tty that never produces a line, to exercise the MFA prompt deadline.
+private class BlockingTty < IO
+  def tty? : Bool
+    true
+  end
+
+  def read(slice : Bytes) : Int32
+    sleep
+    0
+  end
+
+  def write(slice : Bytes) : Nil
+  end
+end
+
 describe KrikriAwsSsm::CredentialChain do
   it "never reveals secrets from Credentials#to_s" do
     credentials = KrikriAwsSsm::Credentials.new("AKIDEXAMPLE", "super-secret", "session-token")
@@ -57,6 +72,33 @@ describe KrikriAwsSsm::CredentialChain do
       assert_equal "LEGACYKEY", credentials.access_key
       assert_equal "LEGACYSECRET", credentials.secret_key
       assert_equal "LEGACYTOKEN", credentials.session_token
+    end
+  end
+
+  it "treats empty environment credentials as unset, like botocore" do
+    CredentialSpecHelper.with_temp_dir do |dir|
+      env = {
+        "AWS_ACCESS_KEY_ID"         => "",
+        "AWS_SECRET_ACCESS_KEY"     => "",
+        "AWS_ACCESS_KEY"            => "LEGACYKEY",
+        "AWS_SECRET_KEY"            => "LEGACYSECRET",
+        "AWS_EC2_METADATA_DISABLED" => "true",
+      }
+      credentials = CredentialSpecHelper.chain(env, dir).resolve
+      assert_equal "LEGACYKEY", credentials.access_key
+      assert_equal "LEGACYSECRET", credentials.secret_key
+    end
+  end
+
+  it "names the missing key of a partial static profile" do
+    CredentialSpecHelper.with_temp_dir do |dir|
+      CredentialSpecHelper.write(File.join(dir, "credentials"),
+        "[partial]\naws_access_key_id = PARTIALKEY\n")
+      env = {"AWS_EC2_METADATA_DISABLED" => "true"}
+      chain = CredentialSpecHelper.chain(env, dir)
+      error = assert_raises(KrikriAwsSsm::CredentialsError) { chain.resolve("partial") }
+      assert_includes error.message.to_s, "Partial credentials"
+      assert_includes error.message.to_s, "aws_secret_access_key"
     end
   end
 
@@ -182,6 +224,42 @@ describe KrikriAwsSsm::CredentialChain do
       assert_equal "PROCESS2", second.access_key
       assert_equal "2", File.read(counter).strip
     end
+  end
+
+  it "returns credentials the chain never issued unchanged from refresh" do
+    calls = 0
+    chain = KrikriAwsSsm::CredentialChain.new([
+      ->(_profile : String?) do
+        calls += 1
+        KrikriAwsSsm::Credentials.new("KEY", "SECRET",
+          expires_at: Time.utc + 1.minute).as(KrikriAwsSsm::Credentials?)
+      end,
+    ])
+    foreign = KrikriAwsSsm::Credentials.new("FOREIGN", "FOREIGNSECRET",
+      expires_at: Time.utc + 1.minute)
+
+    assert_equal foreign, chain.refresh(foreign)
+    assert_equal 0, calls
+  end
+
+  it "resolves one refresh for concurrent callers holding the same expiring credentials" do
+    calls = 0
+    chain = KrikriAwsSsm::CredentialChain.new([
+      ->(_profile : String?) do
+        calls += 1
+        expires_at = calls == 1 ? Time.utc + 1.minute : nil
+        KrikriAwsSsm::Credentials.new("KEY#{calls}", "SECRET#{calls}",
+          expires_at: expires_at).as(KrikriAwsSsm::Credentials?)
+      end,
+    ])
+    first = chain.resolve
+    refreshed = chain.refresh(first)
+    assert_equal 2, calls
+
+    results = Channel(KrikriAwsSsm::Credentials).new(5)
+    5.times { spawn { results.send(chain.refresh(first)) } }
+    5.times { assert_equal refreshed, receive_with_timeout(results) }
+    assert_equal 2, calls
   end
 
   it "raises a secret-free CredentialsError when credential_process fails" do
@@ -602,6 +680,30 @@ describe KrikriAwsSsm::CredentialChain do
       error = assert_raises(KrikriAwsSsm::CredentialsError) { chain.resolve("mfa") }
       assert_includes error.message.to_s, "No MFA code was entered"
       assert_includes error.message.to_s, "arn:aws:iam::123456789012:mfa/user"
+    end
+  end
+
+  it "times out a hung MFA prompt instead of holding the chain" do
+    CredentialSpecHelper.with_temp_dir do |dir|
+      CredentialSpecHelper.write(File.join(dir, "config"), <<-INI)
+        [profile base]
+        aws_access_key_id = BASEKEY
+        aws_secret_access_key = BASESECRET
+
+        [profile mfa]
+        role_arn = arn:aws:iam::123456789012:role/MfaRole
+        source_profile = base
+        mfa_serial = arn:aws:iam::123456789012:mfa/user
+        INI
+      config = CredentialSpecHelper.config(
+        {"AWS_EC2_METADATA_DISABLED" => "true"}, dir,
+        mfa_input: BlockingTty.new, mfa_output: IO::Memory.new,
+        mfa_echo_control: ->(_enabled : Bool) { true })
+      config.mfa_timeout = 100.milliseconds
+      chain = KrikriAwsSsm::CredentialChain.new(config)
+
+      error = assert_raises(KrikriAwsSsm::CredentialsError) { chain.resolve("mfa") }
+      assert_includes error.message.to_s, "Timed out waiting for the MFA code"
     end
   end
 

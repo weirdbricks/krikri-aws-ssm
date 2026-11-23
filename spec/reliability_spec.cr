@@ -23,7 +23,7 @@ end
 
 describe KrikriAwsSsm::Reliability do
   it "retransmits only the head after the initial 200ms RTO" do
-    clock = Time::Span.zero
+    clock = Time::Instant.new(0_i64, 0_i32)
     reliability = KrikriAwsSsm::Reliability.new(now: -> { clock })
     first = reliability.allocate
     second = reliability.allocate
@@ -39,8 +39,22 @@ describe KrikriAwsSsm::Reliability do
     assert_equal [first, second], reliability.pending_sequences
   end
 
+  it "rolls back a tracked frame when its send fails" do
+    clock = Time::Instant.new(0_i64, 0_i32)
+    reliability = KrikriAwsSsm::Reliability.new(now: -> { clock })
+    sequence = reliability.allocate
+    reliability.track(sequence, Bytes[1, 2, 3])
+    assert_equal 1, reliability.pending
+    assert_equal 3_i64, reliability.pending_bytes
+
+    reliability.untrack(sequence)
+    assert_equal 0, reliability.pending
+    assert_equal 0_i64, reliability.pending_bytes
+    assert_empty reliability.pending_sequences
+  end
+
   it "updates the RTO with the Jacobson/Karels formula" do
-    clock = Time::Span.zero
+    clock = Time::Instant.new(0_i64, 0_i32)
     reliability = KrikriAwsSsm::Reliability.new(now: -> { clock })
     sequence = reliability.allocate
     reliability.track(sequence, Bytes[1])
@@ -55,7 +69,7 @@ describe KrikriAwsSsm::Reliability do
   end
 
   it "clamps the RTO to 50ms..1s, matching config.go's MaxTransmissionTimeout" do
-    clock = Time::Span.zero
+    clock = Time::Instant.new(0_i64, 0_i32)
     reliability = KrikriAwsSsm::Reliability.new(now: -> { clock })
     50.times do
       fast = reliability.allocate
@@ -86,7 +100,7 @@ describe KrikriAwsSsm::Reliability do
   end
 
   it "reports transfer statistics and wakes a writer when an ack frees room" do
-    clock = Time::Span.zero
+    clock = Time::Instant.new(0_i64, 0_i32)
     reliability = KrikriAwsSsm::Reliability.new(now: -> { clock })
     sequence = reliability.allocate
     reliability.track(sequence, Bytes.new(10))
@@ -109,7 +123,7 @@ describe KrikriAwsSsm::Reliability do
   end
 
   it "does not sample the round trip of a retransmitted message" do
-    clock = Time::Span.zero
+    clock = Time::Instant.new(0_i64, 0_i32)
     reliability = KrikriAwsSsm::Reliability.new(now: -> { clock })
     sequence = reliability.allocate
     reliability.track(sequence, Bytes[1])
@@ -123,7 +137,7 @@ describe KrikriAwsSsm::Reliability do
   end
 
   it "returns false for an already acknowledged sequence" do
-    clock = Time::Span.zero
+    clock = Time::Instant.new(0_i64, 0_i32)
     reliability = KrikriAwsSsm::Reliability.new(now: -> { clock })
     sequence = reliability.allocate
     reliability.track(sequence, Bytes[1])
@@ -132,7 +146,7 @@ describe KrikriAwsSsm::Reliability do
   end
 
   it "gives up after the configured attempt count" do
-    clock = Time::Span.zero
+    clock = Time::Instant.new(0_i64, 0_i32)
     reliability = KrikriAwsSsm::Reliability.new(1, -> { clock })
     sequence = reliability.allocate
     reliability.track(sequence, Bytes[1])
@@ -190,6 +204,32 @@ describe KrikriAwsSsm::InboundSequencer do
     assert_equal KrikriAwsSsm::InboundSequencer::Disposition::Overflow, acceptance.disposition
     assert_equal 1, sequencer.buffered
   end
+
+  it "replaces a buffered retransmit instead of overflowing the buffer" do
+    sequencer = KrikriAwsSsm::InboundSequencer(String).new(1)
+    assert_equal KrikriAwsSsm::InboundSequencer::Disposition::Buffered,
+      sequencer.accept(1_i64, "b", 1).disposition
+
+    acceptance = sequencer.accept(1_i64, "b2", 2)
+    assert_equal KrikriAwsSsm::InboundSequencer::Disposition::Buffered, acceptance.disposition
+    assert_equal 2_i64, sequencer.buffered_bytes
+    assert_equal ["a", "b2"], sequencer.accept(0_i64, "a", 1).items
+  end
+
+  it "meters buffered bytes against the byte limit" do
+    sequencer = KrikriAwsSsm::InboundSequencer(String).new(max_bytes: 5)
+    assert_equal KrikriAwsSsm::InboundSequencer::Disposition::Buffered,
+      sequencer.accept(1_i64, "aa", 3).disposition
+    assert_equal 3_i64, sequencer.buffered_bytes
+
+    acceptance = sequencer.accept(2_i64, "bb", 3)
+    assert_equal KrikriAwsSsm::InboundSequencer::Disposition::Overflow, acceptance.disposition
+    assert_equal 3_i64, sequencer.buffered_bytes
+
+    acceptance = sequencer.accept(0_i64, "z", 1)
+    assert_equal ["z", "aa"], acceptance.items
+    assert_equal 0_i64, sequencer.buffered_bytes
+  end
 end
 
 describe KrikriAwsSsm::StreamUrl do
@@ -198,6 +238,18 @@ describe KrikriAwsSsm::StreamUrl do
       assert KrikriAwsSsm::StreamUrl.presigned?("wss://host/x?#{param}=value"), param
     end
     refute KrikriAwsSsm::StreamUrl.presigned?("wss://host/x")
+  end
+
+  it "decodes query names and ignores a malformed URL" do
+    assert KrikriAwsSsm::StreamUrl.presigned?("wss://host/x?X%2DAmz%2DSignature=secret")
+    refute KrikriAwsSsm::StreamUrl.presigned?("wss://host/x?X-Amz-Signature-Other=value")
+    refute KrikriAwsSsm::StreamUrl.presigned?("http://foo:bar/x?X-Amz-Signature=secret")
+  end
+
+  it "keeps the path and query in the request target" do
+    uri = KrikriAwsSsm::StreamUrl.parse("wss://host:8443/v1/data-channel/s-1?A=B")
+    assert_equal "/v1/data-channel/s-1?A=B", KrikriAwsSsm::StreamUrl.request_target(uri)
+    assert_equal "host:8443", KrikriAwsSsm::StreamUrl.authority(uri)
   end
 
   it "accepts a wss URL on an AWS host" do

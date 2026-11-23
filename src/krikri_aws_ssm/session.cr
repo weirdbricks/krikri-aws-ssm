@@ -42,13 +42,31 @@ module KrikriAwsSsm
   class Session
     getter session_id : String
     getter client_id : String
-    getter close_reason : CloseReason?
-    getter exit_code : Int32?
+
+    # The state below is written on one fiber and read on another (reader,
+    # writer, liveness, resume), so both sides go through @state_mutex
+    # instead of relying on the scheduler's memory ordering.
+    def close_reason : CloseReason?
+      @state_mutex.synchronize { @close_reason }
+    end
+
+    def exit_code : Int32?
+      @state_mutex.synchronize { @exit_code }
+    end
+
     # `channel_closed` Output text, verbatim from the agent.
-    getter channel_output : String?
+    def channel_output : String?
+      @state_mutex.synchronize { @channel_output }
+    end
+
     # Last transport/protocol error, for callers that report unreachable text.
-    getter error : Exception?
-    getter session_type : String?
+    def error : Exception?
+      @state_mutex.synchronize { @error }
+    end
+
+    def session_type : String?
+      @state_mutex.synchronize { @session_type }
+    end
 
     # Output is handed to `read?` through a growable queue, never a bounded
     # channel: the websocket reader must keep consuming frames (notably the
@@ -62,7 +80,6 @@ module KrikriAwsSsm
     @output_mutex = Mutex.new
     @output_finished = false
     @output_signal = Channel(Nil).new(1)
-    @inbound = InboundSequencer(Message).new
     @reliability = Reliability.new
     @write_mutex = Mutex.new
     @send_mutex = Mutex.new
@@ -73,7 +90,20 @@ module KrikriAwsSsm
     @handshake_notified = false
     @handshake_done = Channel(Nil).new(1)
     @handshake_error : Exception?
-    @last_inbound = Time.monotonic
+    # Fibers other than the reader observe these through the accessors above.
+    @close_reason : CloseReason?
+    @exit_code : Int32?
+    @channel_output : String?
+    @error : Exception?
+    @session_type : String?
+    # Last *progress* (a delivery or a client message actually acknowledged),
+    # not the last inbound byte: a chatty peer can fill the reader forever
+    # while the sequencer is wedged, and acking duplicates or unknown
+    # sequences is not progress either.
+    @last_progress = Time.instant
+    # When the first out-of-order frame arrived; nil while the stream is
+    # contiguous. A gap older than `idle_timeout` is a protocol wedge.
+    @gap_since : Time::Instant?
     @generation = 0
     @ws : HTTP::WebSocket?
     @io : IO?
@@ -92,6 +122,10 @@ module KrikriAwsSsm
                    @kms : Kms? = nil)
       @session_id = @info.session_id
       @client_id = UUID.random.to_s
+      # Buffered-but-undelivered frames hold full payload copies and are acked
+      # (so the agent gets no backpressure); meter them like unread output.
+      @inbound = InboundSequencer(Message).new(
+        max_bytes: @settings.output_buffer_limit)
     end
 
     # The session holds `@info` (stream URL and token) and settings holding
@@ -106,14 +140,14 @@ module KrikriAwsSsm
 
     # True once the KMS handshake action succeeded and payload encryption is on.
     def encryption_enabled? : Bool
-      @encryption_enabled
+      @state_mutex.synchronize { @encryption_enabled }
     end
 
     # Dial the data channel, send the token in the open message and wait for
     # the agent handshake to complete.
     def connect : Nil
-      open_channel(@info)
-      send_open_message(@info)
+      generation = open_channel(@info)
+      send_open_message(@info, generation)
       await_handshake
     end
 
@@ -187,25 +221,36 @@ module KrikriAwsSsm
       @state_mutex.synchronize { @closed }
     end
 
+    private def terminated? : Bool
+      @state_mutex.synchronize { @terminated }
+    end
+
+    private def record_error(error : Exception) : Nil
+      @state_mutex.synchronize { @error = error }
+    end
+
     # The data-channel transport (the TLS or plain TCP socket). Diagnostic,
     # and what the spec pins `TCP_NODELAY` on.
     def transport : IO?
-      @io
+      @state_mutex.synchronize { @io }
     end
 
     # Terminate the session on the control plane and close the channel.
-    # Idempotent.
+    # Idempotent. The control-plane call is made even when the transport has
+    # already died: a NetworkLost session is still live service-side until it
+    # is reclaimed, and `resume` is then blocked by @terminated. A session
+    # that already ended answers SessionNotFound, which is swallowed.
     def terminate : Nil
       first = @state_mutex.synchronize do
         next false if @terminated
         @terminated = true
         true
       end
-      if first && !closed?
+      if first
         begin
           @client.terminate_session(@session_id)
         rescue ex : ApiError
-          @error = ex
+          record_error(ex)
         end
       end
       close!(CloseReason::Terminated)
@@ -217,12 +262,20 @@ module KrikriAwsSsm
     # handshake is not replayed.
     def resume : Nil
       raise ChannelClosed.new("session was not closed") unless closed?
-      raise ChannelClosed.new("session was terminated") if @terminated
+      raise ChannelClosed.new("session was terminated") if terminated?
       info = @client.resume_session(@session_id)
       @info = info
       reset_for_reconnect
-      open_channel(info)
-      send_open_message(info)
+      begin
+        generation = open_channel(info)
+        send_open_message(info, generation)
+      rescue ex : Exception
+        # reset_for_reconnect cleared @closed; a failed reopen would leave the
+        # session reporting open with a dead transport, unreadable and
+        # unresumable. Re-close with the failure as the reason.
+        close!(CloseReason::NetworkLost, ex)
+        raise ex
+      end
     end
 
     private def reset_for_reconnect : Nil
@@ -234,6 +287,9 @@ module KrikriAwsSsm
         @closed = false
         @close_reason = nil
         @error = nil
+        # Sticky via `||=` on close, so it must be cleared here or a resume
+        # reports the previous connection's failure.
+        @handshake_error = nil
         @output_mutex.synchronize do
           @output = Deque(Output).new
           @output_bytes = 0_i64
@@ -243,54 +299,61 @@ module KrikriAwsSsm
         @handshake_done = Channel(Nil).new(1)
         @handshake_notified = false
         @handshake_complete = true
+        @gap_since = nil
       end
     end
 
     # --- transport ---------------------------------------------------------
 
-    private def open_channel(info : SessionInfo) : Nil
+    private def open_channel(info : SessionInfo) : Int32
       uri = StreamUrl.parse(info.stream_url)
       StreamUrl.validate!(uri, @settings.allow_insecure_endpoint?)
       io = dial(uri)
-      @io = io
-      @last_inbound = Time.monotonic
       ws = HTTP::WebSocket.new(HTTP::WebSocket::Protocol.new(io, masked: true, sync_close: true))
-      @ws = ws
-      ws.on_binary { |bytes| handle_frame(bytes) }
-      generation = @state_mutex.synchronize { @generation }
+      generation = @state_mutex.synchronize do
+        @io = io
+        @ws = ws
+        @last_progress = Time.instant
+        @gap_since = nil
+        @generation
+      end
+      ws.on_binary { |bytes| handle_frame(bytes, generation) }
       ws.on_close { |_code, _message| close!(CloseReason::NetworkLost) if current?(generation) }
       spawn { read_loop(ws, generation) }
       spawn { retransmit_loop(generation) }
       spawn { ping_loop(generation) }
       spawn { liveness_loop(generation) }
+      generation
     end
 
     private def dial(uri : URI) : IO
       host = uri.host
       raise ProtocolError.new("StreamUrl has no host") unless host
       port = uri.port || (uri.scheme == "wss" ? 443 : 80)
-      # A black-holed gateway must not park connect/resume forever: the
-      # liveness fibers only start after the upgrade completes.
-      tcp = TCPSocket.new(host, port, connect_timeout: @settings.connect_timeout)
+      tcp : TCPSocket? = nil
       begin
+        # A black-holed gateway must not park connect/resume forever: the
+        # liveness fibers only start after the upgrade completes.
+        socket = TCPSocket.new(host, port, connect_timeout: @settings.connect_timeout)
+        tcp = socket
         # A websocket frame is several small writes and the payload is usually
         # below one MSS. With Nagle on (Crystal's default, unlike Go's) every
         # message waits for the previous one's delayed acknowledgement, which
         # caps a sustained upload at about one MSS per RTT (~30 KiB/s on a
         # typical link). Go's net package, and therefore the reference plugin,
         # disables Nagle by default. See docs/protocol.md.
-        tcp.tcp_nodelay = @settings.tcp_nodelay?
+        socket.tcp_nodelay = @settings.tcp_nodelay?
         # Bound the TLS/client handshake and the upgrade read; the established
         # channel is long-lived and frame pacing is handled by the ping/idle
         # loops, so the timeout is cleared before the socket is returned.
         # Set on the TCP socket: the TLS socket delegates its reads to it.
-        tcp.read_timeout = @settings.read_timeout
+        socket.read_timeout = @settings.read_timeout
         io = if uri.scheme == "wss"
                context = OpenSSL::SSL::Context::Client.new
-               OpenSSL::SSL::Socket::Client.new(tcp, context: context, sync_close: true,
+               OpenSSL::SSL::Socket::Client.new(socket, context: context, sync_close: true,
                  hostname: host)
              else
-               tcp
+               socket
              end
 
         headers = HTTP::Headers{"Host" => StreamUrl.authority(uri)}
@@ -316,28 +379,28 @@ module KrikriAwsSsm
         request.to_io(io)
         io.flush
         response = HTTP::Client::Response.from_io(io, ignore_body: true)
-        tcp.read_timeout = nil
+        socket.read_timeout = nil
         unless response.status.switching_protocols?
-          quietly { tcp.close }
+          quietly { socket.close }
           raise HandshakeFailed.new(
             "data-channel upgrade to #{StreamUrl.redact(uri)} returned HTTP #{response.status_code}")
         end
         expected = HTTP::WebSocket::Protocol.key_challenge(key)
         unless response.headers["Sec-WebSocket-Accept"]? == expected
-          quietly { tcp.close }
+          quietly { socket.close }
           raise HandshakeFailed.new("data-channel upgrade did not return a valid Sec-WebSocket-Accept")
         end
         io
       rescue ex : Socket::Error | OpenSSL::SSL::Error | IO::Error
         # Closing the TCP socket covers a failure before or during the TLS
         # handshake; the TLS socket wraps it with sync_close.
-        quietly { tcp.close }
+        quietly { tcp.try(&.close) }
         raise HandshakeFailed.new(
           "failed to open data channel #{StreamUrl.redact(uri)}: #{ex.message}", cause: ex)
       end
     end
 
-    private def send_open_message(info : SessionInfo) : Nil
+    private def send_open_message(info : SessionInfo, generation : Int32) : Nil
       payload = JSON.build do |json|
         json.object do
           json.field "MessageSchemaVersion", "1.0"
@@ -347,15 +410,15 @@ module KrikriAwsSsm
           json.field "ClientVersion", @settings.client_version
         end
       end
-      send_text(payload)
+      send_text(payload, generation)
     end
 
     private def read_loop(ws : HTTP::WebSocket, generation : Int32) : Nil
       ws.run
     rescue ex : IO::Error | Socket::Error | OpenSSL::SSL::Error
-      @error = ex if current?(generation)
+      record_error(ex) if current?(generation)
     ensure
-      close!(CloseReason::NetworkLost) if current?(generation)
+      close!(CloseReason::NetworkLost, generation: generation) if current?(generation)
     end
 
     private def current?(generation : Int32) : Bool
@@ -368,11 +431,10 @@ module KrikriAwsSsm
         next unless current?(generation)
         begin
           if frame = @reliability.retransmission
-            send_raw(frame)
+            send_raw(frame, generation)
           end
         rescue ex : Reliability::RetransmissionTimeout
-          @error = ex
-          close!(CloseReason::ProtocolError)
+          close!(CloseReason::ProtocolError, ex, generation)
         rescue ChannelClosed
           # The session went away between the loop guard and the send.
           break
@@ -386,8 +448,17 @@ module KrikriAwsSsm
         next unless current?(generation)
         # A ping is a websocket frame like any other: serialize it with data
         # writes (the reference plugin takes its write lock here too), or two
-        # fibers can interleave frame fragments on the wire.
-        quietly { @send_mutex.synchronize { @ws.try(&.ping) } }
+        # fibers can interleave frame fragments on the wire. Re-check the
+        # generation and take the socket under the state lock: `resume` may
+        # have replaced it.
+        quietly do
+          @send_mutex.synchronize do
+            ws, current = @state_mutex.synchronize do
+              {@ws, !@closed && @generation == generation}
+            end
+            ws.ping if ws && current
+          end
+        end
       end
     end
 
@@ -395,9 +466,21 @@ module KrikriAwsSsm
       while current?(generation)
         sleep 1.second
         next unless current?(generation)
-        last_inbound = @state_mutex.synchronize { @last_inbound }
-        if Time.monotonic - last_inbound > @settings.idle_timeout
-          close!(CloseReason::SessionTimeout)
+        # An inbound sequence gap that never heals is a protocol wedge, not
+        # an idle session: report it as such instead of waiting for traffic
+        # to stop completely. Checked before idle so a wedge is not mislabelled.
+        gap_since = @state_mutex.synchronize { @gap_since }
+        if gap_since && Time.instant - gap_since > @settings.idle_timeout
+          close!(CloseReason::ProtocolError,
+            ProtocolError.new("inbound sequence gap did not heal within #{@settings.idle_timeout}"),
+            generation)
+          break
+        end
+        # Progress, not traffic: a wedged sequencer whose peer keeps
+        # retransmitting buffered or duplicate frames makes no progress.
+        last_progress = @state_mutex.synchronize { @last_progress }
+        if Time.instant - last_progress > @settings.idle_timeout
+          close!(CloseReason::SessionTimeout, generation: generation)
           break
         end
         # An ack-stalled stream is stuck even if the agent keeps sending
@@ -414,18 +497,21 @@ module KrikriAwsSsm
 
     # --- inbound -----------------------------------------------------------
 
-    private def handle_frame(bytes : Bytes) : Nil
+    private def handle_frame(bytes : Bytes, generation : Int32) : Nil
+      # A frame from the connection `resume` replaced must never touch the
+      # resumed session (output, acks or a close).
+      return unless current?(generation)
       message = Message.decode(bytes)
-      @state_mutex.synchronize { @last_inbound = Time.monotonic }
       case message.message_type
       when MessageType::OUTPUT_STREAM_DATA
-        handle_output_stream(message)
+        handle_output_stream(message, generation)
       when MessageType::ACKNOWLEDGE
         ack = AcknowledgeContent.from_json(String.new(message.payload))
-        @reliability.acknowledge(ack.sequence_number)
+        mark_progress if @reliability.acknowledge(ack.sequence_number)
       when MessageType::CHANNEL_CLOSED
-        @channel_output = ChannelClosedContent.from_json(String.new(message.payload)).output
-        close!(CloseReason::AgentClosed)
+        output = ChannelClosedContent.from_json(String.new(message.payload)).output
+        @state_mutex.synchronize { @channel_output = output }
+        close!(CloseReason::AgentClosed, generation: generation)
       when MessageType::START_PUBLICATION, MessageType::PAUSE_PUBLICATION
         # Advisory only. The reference plugin's OutputMessageHandler ignores
         # both message types, and blocking writes on a real agent's pause
@@ -434,52 +520,63 @@ module KrikriAwsSsm
         # Unknown message types are ignored, matching OutputMessageHandler.
       end
     rescue ex : ProtocolError | JSON::ParseException
-      @error = ex
-      close!(CloseReason::ProtocolError)
+      close!(CloseReason::ProtocolError, ex, generation)
     rescue ChannelClosed
       # The session closed while this frame was being processed.
     end
 
-    private def handle_output_stream(message : Message) : Nil
-      acceptance = @inbound.accept(message.sequence_number, message)
+    private def handle_output_stream(message : Message, generation : Int32) : Nil
+      acceptance = @inbound.accept(message.sequence_number, message, message.payload.size.to_i64)
       case acceptance.disposition
       when InboundSequencer::Disposition::Delivered
+        mark_progress
+        @state_mutex.synchronize { @gap_since = nil } if @inbound.buffered.zero?
         acceptance.items.each do |item|
-          acknowledge(item) if handshake_payload?(item)
-          deliver(item)
-          acknowledge(item) unless handshake_payload?(item)
+          # The reference processes a frame's handler before acknowledging it,
+          # handshake payloads included.
+          deliver(item, generation)
+          acknowledge(item, generation)
         end
       when InboundSequencer::Disposition::Buffered
-        acknowledge(message)
-      when InboundSequencer::Disposition::Duplicate, InboundSequencer::Disposition::Overflow
+        # Buffered frames are acked (there is no other backpressure), so the
+        # gap age is the only thing that can notice a stall.
+        @state_mutex.synchronize { @gap_since ||= Time.instant }
+        acknowledge(message, generation)
+      when InboundSequencer::Disposition::Overflow
+        # A held-out frame dropped unacked leaves the agent's head waiting;
+        # the buffer itself is now meter-bound, so treat it as fatal rather
+        # than silently losing data.
+        close!(CloseReason::ProtocolError,
+          OutputBufferExceeded.new("buffered session output exceeded #{@settings.output_buffer_limit} bytes"),
+          generation)
+      when InboundSequencer::Disposition::Duplicate
         # No ack: double-acking a duplicate confuses the agent's accounting.
       end
     end
 
-    private def handshake_payload?(message : Message) : Bool
-      type = message.payload_type
-      type == PayloadType::HandshakeRequest.value ||
-        type == PayloadType::HandshakeComplete.value ||
-        type == PayloadType::EncChallengeRequest.value
+    private def mark_progress : Nil
+      @state_mutex.synchronize { @last_progress = Time.instant }
     end
 
-    private def deliver(message : Message) : Nil
+    private def deliver(message : Message, generation : Int32) : Nil
       case message.payload_type
       when PayloadType::HandshakeRequest.value
-        handle_handshake_request(message)
+        handle_handshake_request(message, generation)
       when PayloadType::HandshakeComplete.value
         complete_handshake
       when PayloadType::Output.value
-        complete_handshake if !@handshake_complete && @session_type.nil?
+        complete_handshake if !handshake_complete? && session_type.nil?
         emit(Stream::Stdout, payload_bytes(message))
       when PayloadType::StdErr.value
         emit(Stream::Stderr, payload_bytes(message))
       when PayloadType::ExitCode.value
-        @exit_code = parse_exit_code(payload_bytes(message))
+        code = parse_exit_code(payload_bytes(message))
+        @state_mutex.synchronize { @exit_code = code }
       when PayloadType::Error.value
-        @channel_output = String.new(message.payload)
+        text = String.new(message.payload)
+        @state_mutex.synchronize { @channel_output = text }
       when PayloadType::EncChallengeRequest.value
-        handle_encryption_challenge(message)
+        handle_encryption_challenge(message, generation)
       else
         # Size, Parameter and Flag are not exposed by this byte-stream API.
       end
@@ -488,9 +585,19 @@ module KrikriAwsSsm
     # Payload types 1, 11 and 12 are AES-GCM encrypted when KMS is on; the
     # handshake and control payloads stay clear (plugin `streaming.go`).
     private def payload_bytes(message : Message) : Bytes
-      encrypter = @encrypter
-      return message.payload unless encrypter && @encryption_enabled && encrypted_payload?(message.payload_type)
+      encrypter = active_encrypter
+      return message.payload unless encrypter && encrypted_payload?(message.payload_type)
       encrypter.decrypt(message.payload)
+    end
+
+    # The reader writes @encrypter/@encryption_enabled during the handshake;
+    # writer fibers read them. Nil means encryption is not active yet.
+    private def active_encrypter : Encrypter?
+      @state_mutex.synchronize { @encryption_enabled ? @encrypter : nil }
+    end
+
+    private def handshake_complete? : Bool
+      @state_mutex.synchronize { @handshake_complete }
     end
 
     private def encrypted_payload?(payload_type : UInt32) : Bool
@@ -499,13 +606,15 @@ module KrikriAwsSsm
         payload_type == PayloadType::ExitCode.value
     end
 
-    private def handle_encryption_challenge(message : Message) : Nil
-      encrypter = @encrypter
+    private def handle_encryption_challenge(message : Message, generation : Int32) : Nil
+      encrypter = active_encrypter
       unless encrypter
-        @handshake_error = HandshakeFailed.new(
-          "the agent requested an encryption challenge before KMS was negotiated")
+        @state_mutex.synchronize do
+          @handshake_error = HandshakeFailed.new(
+            "the agent requested an encryption challenge before KMS was negotiated")
+        end
         notify_handshake
-        close!(CloseReason::ProtocolError)
+        close!(CloseReason::ProtocolError, generation: generation)
         return
       end
       # `JSON::Any#[]?` raises a bare `Exception` on a non-object payload,
@@ -521,10 +630,10 @@ module KrikriAwsSsm
       end
       send_input(PayloadType::EncChallengeResponse.value, response.to_slice)
     rescue ex : ProtocolError | Base64::Error | JSON::ParseException
-      @error = ex
-      @handshake_error = ex
+      @state_mutex.synchronize { @handshake_error = ex }
+      record_error(ex)
       notify_handshake
-      close!(CloseReason::ProtocolError)
+      close!(CloseReason::ProtocolError, generation: generation)
     end
 
     # Never blocks: the websocket reader has to keep consuming frames even
@@ -545,8 +654,8 @@ module KrikriAwsSsm
       end
       return unless added
       if overflow
-        @error = OutputBufferExceeded.new(
-          "unread session output exceeded #{@settings.output_buffer_limit} bytes")
+        record_error(OutputBufferExceeded.new(
+          "unread session output exceeded #{@settings.output_buffer_limit} bytes"))
         close!(CloseReason::ProtocolError)
         return
       end
@@ -566,7 +675,7 @@ module KrikriAwsSsm
       match.try(&.[1].to_i?)
     end
 
-    private def handle_handshake_request(message : Message) : Nil
+    private def handle_handshake_request(message : Message, generation : Int32) : Nil
       request = Handshake::HandshakeRequestPayload.from_json(String.new(message.payload))
       processed = [] of Handshake::ProcessedClientAction
       errors = [] of String
@@ -610,9 +719,9 @@ module KrikriAwsSsm
       send_input(PayloadType::HandshakeResponse.value, response.to_json.to_slice)
 
       if failed = kms_error
-        @handshake_error = failed
+        @state_mutex.synchronize { @handshake_error = failed }
         notify_handshake
-        close!(CloseReason::ProtocolError)
+        close!(CloseReason::ProtocolError, generation: generation)
       end
     end
 
@@ -622,8 +731,10 @@ module KrikriAwsSsm
       raise HandshakeFailed.new("KMSEncryption action is missing its parameters") unless parameters
       request = Handshake::KMSEncryptionRequest.from_json(parameters.to_json)
       data_key = kms_client.generate_data_key(request.kms_key_id, @session_id, @settings.target)
-      @encrypter = Encrypter.new(data_key.plaintext)
-      @encryption_enabled = true
+      @state_mutex.synchronize do
+        @encrypter = Encrypter.new(data_key.plaintext)
+        @encryption_enabled = true
+      end
       JSON.parse(JSON.build do |json|
         json.object do
           json.field "KMSCipherTextKey", Base64.strict_encode(data_key.ciphertext_blob)
@@ -649,10 +760,10 @@ module KrikriAwsSsm
       case request.session_type
       when SessionType::STANDARD_STREAM, SessionType::INTERACTIVE_COMMANDS,
            SessionType::NON_INTERACTIVE_COMMANDS
-        @session_type = SessionType::STANDARD_STREAM
+        @state_mutex.synchronize { @session_type = SessionType::STANDARD_STREAM }
         true
       when SessionType::PORT
-        @session_type = request.session_type
+        @state_mutex.synchronize { @session_type = request.session_type }
         true
       else
         false
@@ -662,18 +773,20 @@ module KrikriAwsSsm
     end
 
     private def complete_handshake : Nil
-      return if @handshake_complete
-      @handshake_complete = true
-      notify_handshake
+      notify = @state_mutex.synchronize do
+        next false if @handshake_complete
+        @handshake_complete = true
+        true
+      end
+      notify_handshake if notify
     end
 
     private def await_handshake : Nil
       select
       when @handshake_done.receive
-        if error = @handshake_error
-          raise error
-        end
-        unless @handshake_complete
+        error, complete = @state_mutex.synchronize { {@handshake_error, @handshake_complete} }
+        raise error if error
+        unless complete
           raise HandshakeFailed.new("session closed before the agent completed the handshake")
         end
       when timeout(@settings.connect_timeout)
@@ -696,8 +809,8 @@ module KrikriAwsSsm
     private def send_input(payload_type : UInt32, payload : Bytes) : Nil
       @write_mutex.synchronize do
         raise_closed if closed?
-        if @encryption_enabled && payload_type == PayloadType::Output.value
-          if encrypter = @encrypter
+        if payload_type == PayloadType::Output.value
+          if encrypter = active_encrypter
             payload = encrypter.encrypt(payload)
           end
         end
@@ -708,8 +821,17 @@ module KrikriAwsSsm
           payload_type: payload_type,
           sequence_number: sequence,
         ).encode
-        send_raw(frame)
+        # Track before sending: an ACK can arrive before `send_raw` returns
+        # (an in-process peer has ~0 RTT), and an ACK for an untracked
+        # sequence is discarded, leaving the frame unacked forever. Roll the
+        # entry back when the send fails.
         @reliability.track(sequence, frame)
+        begin
+          send_raw(frame)
+        rescue ex
+          @reliability.untrack(sequence)
+          raise ex
+        end
       end
     end
 
@@ -728,7 +850,7 @@ module KrikriAwsSsm
       end
     end
 
-    private def acknowledge(message : Message) : Nil
+    private def acknowledge(message : Message, generation : Int32) : Nil
       content = AcknowledgeContent.new(
         message.message_type, message.message_id.to_s, message.sequence_number)
       frame = Message.new(
@@ -736,54 +858,65 @@ module KrikriAwsSsm
         payload: content.to_json.to_slice,
         flags: Flags::ACK,
       ).encode
-      send_raw(frame)
+      send_raw(frame, generation)
     end
 
-    private def send_text(payload : String) : Nil
-      ws = @ws
-      raise ChannelClosed.new("session is closed") if ws.nil? || ws.closed?
-      @send_mutex.synchronize { ws.send(payload) }
-    rescue ex : IO::Error
-      @error = ex
-      close!(CloseReason::NetworkLost)
-      raise ChannelClosed.new("session channel is closed", cause: ex)
+    private def send_text(payload : String, generation : Int32? = nil) : Nil
+      send_frame_bytes(payload.to_slice, payload, generation)
     end
 
-    private def send_raw(bytes : Bytes) : Nil
-      ws = @ws
-      raise ChannelClosed.new("session is closed") if ws.nil? || ws.closed?
-      @send_mutex.synchronize { ws.send(bytes) }
+    private def send_raw(bytes : Bytes, generation : Int32? = nil) : Nil
+      send_frame_bytes(bytes, nil, generation)
+    end
+
+    # Take the send lock before the state lock (the same order ping_loop
+    # uses), then send on the socket that lock saw: `resume` may otherwise
+    # swap @ws between the check and the write.
+    private def send_frame_bytes(bytes : Bytes, text : String?, generation : Int32?) : Nil
+      @send_mutex.synchronize do
+        ws, current = @state_mutex.synchronize do
+          {@ws, generation.nil? || (@generation == generation && !@closed)}
+        end
+        raise ChannelClosed.new("session generation is stale") if !current
+        raise ChannelClosed.new("session is closed") if ws.nil? || ws.closed?
+        text ? ws.send(text) : ws.send(bytes)
+      end
     rescue ex : IO::Error
-      @error = ex
-      close!(CloseReason::NetworkLost)
+      close!(CloseReason::NetworkLost, ex, generation)
       raise ChannelClosed.new("session channel is closed", cause: ex)
     end
 
     private def raise_closed : Nil
       raise ChannelClosed.new(
-        "session #{@session_id} is closed (#{@close_reason || CloseReason::NetworkLost})")
+        "session #{@session_id} is closed (#{close_reason || CloseReason::NetworkLost})")
     end
 
     # --- lifecycle ---------------------------------------------------------
 
-    private def close!(reason : CloseReason, error : Exception? = nil) : Nil
+    private def close!(reason : CloseReason, error : Exception? = nil,
+                       generation : Int32? = nil) : Nil
       # Snapshot the connection this close belongs to: `resume` may replace
       # @ws/@io/@output_signal while the teardown below is still running, and
-      # the old close must never touch the resumed session.
+      # the old close must never touch the resumed session. A close naming a
+      # generation is dropped once that generation has been replaced.
       snapshot = @state_mutex.synchronize do
+        next if generation && generation != @generation
         next if @closed
         @closed = true
         @close_reason = reason
         @error = error || @error
-        {ws: @ws, io: @io, signal: @output_signal, generation: @generation}
+        {ws: @ws, io: @io, signal: @output_signal, generation: @generation,
+         encrypter: @encrypter}
       end
       return unless snapshot
 
-      @handshake_error ||= error
+      @state_mutex.synchronize { @handshake_error ||= error }
       notify_handshake
       @reliability.wake
       quietly { snapshot[:ws].try(&.close) }
       quietly { snapshot[:io].try(&.close) }
+      # Key material out of memory as soon as the channel is gone.
+      quietly { snapshot[:encrypter].try(&.wipe) }
       same_generation = @state_mutex.synchronize { @generation == snapshot[:generation] }
       if same_generation
         @output_mutex.synchronize { @output_finished = true }

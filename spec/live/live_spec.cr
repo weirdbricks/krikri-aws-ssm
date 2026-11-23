@@ -47,11 +47,11 @@ module LiveSpecData
   def self.read_until(session : KrikriAwsSsm::Session, pattern : Regex,
                       timeout : Time::Span = 60.seconds, begin_marker : String? = nil) : String
     buffer = IO::Memory.new
-    deadline = Time.monotonic + timeout
+    deadline = Time.instant + timeout
     loop do
       text = buffer.to_s
       break if text =~ pattern
-      remaining = deadline - Time.monotonic
+      remaining = deadline - Time.instant
       raise "timed out waiting for #{pattern} in #{text.inspect}" if remaining <= Time::Span.zero
       output = read_with_timeout(session, remaining)
       if output.nil?
@@ -150,10 +150,10 @@ describe "live SSM" do
                     "printf '\\n%s:%s\\n' #{end_marker} \"$?\"\r")
       LiveSpecData.read_until(session, /#{ready_marker}/, 30.seconds)
       before = session.stats
-      started = Time.monotonic
+      started = Time.instant
       session.write(data)
       upload = LiveSpecData.read_until(session, /#{end_marker}:/, 180.seconds, begin_marker)
-      elapsed = Time.monotonic - started
+      elapsed = Time.instant - started
       expected = Digest::MD5.hexdigest(payload)
       assert_includes upload, expected
       LiveSpecData.report("live 1MiB upload", before, session.stats, wrapped, elapsed)
@@ -199,19 +199,19 @@ describe "live SSM" do
       LiveSpecData.read_until(session, /#{ready_marker}/, 30.seconds)
 
       before = session.stats
-      started = Time.monotonic
+      started = Time.instant
       first_mib_at = nil
       written = 0_i64
       lines.each do |line|
         session.write(line + "\n")
         written += line.bytesize + 1
         if first_mib_at.nil? && written >= 1_048_576
-          first_mib_at = Time.monotonic
+          first_mib_at = Time.instant
         end
       end
-      handed_off = Time.monotonic
+      handed_off = Time.instant
       upload = LiveSpecData.read_until(session, /#{end_marker}:/, 240.seconds, begin_marker)
-      finished = Time.monotonic
+      finished = Time.instant
 
       assert_includes upload, Digest::MD5.hexdigest(payload)
       if burst = first_mib_at
@@ -238,9 +238,9 @@ describe "live SSM" do
     session = KrikriAwsSsm::Session.open(LiveSpecData.settings, client: client)
     session_id = session.session_id
     session.terminate
-    deadline = Time.monotonic + 60.seconds
+    deadline = Time.instant + 60.seconds
     active = true
-    while active && Time.monotonic < deadline
+    while active && Time.instant < deadline
       active = client.describe_sessions.any? do |entry|
         entry["SessionId"]?.try(&.as_s?) == session_id &&
           entry["Status"]?.try(&.as_s?) == "Connected"
@@ -262,13 +262,13 @@ describe "live SSM credentials" do
     Dir.mkdir(dir, 0o700)
     begin
       credentials_file = File.join(dir, "credentials")
-      File.write(credentials_file, <<-INI)
+      File.write(credentials_file, <<-INI, perm: 0o600)
         [live-source]
         aws_access_key_id = #{access_key}
         aws_secret_access_key = #{secret_key}
         INI
       config_file = File.join(dir, "config")
-      File.write(config_file, <<-INI)
+      File.write(config_file, <<-INI, perm: 0o600)
         [profile live-assumed]
         role_arn = #{role_arn}
         source_profile = live-source

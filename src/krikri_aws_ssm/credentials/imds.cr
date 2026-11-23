@@ -6,9 +6,12 @@ require "./types"
 
 module KrikriAwsSsm
   class CredentialChain
-    # EC2 instance metadata credentials (IMDSv2). A PUT fetches a session
-    # token, then every role/credential GET carries it. Short timeouts and no
-    # proxy keep a non-EC2 machine from stalling the chain.
+    # EC2 instance metadata credentials. A PUT fetches an IMDSv2 session
+    # token, then every role/credential GET carries it. When the token PUT is
+    # rejected (an `HttpTokens=optional` instance), the GETs are retried
+    # without the token unless `AWS_EC2_METADATA_V1_DISABLED` forbids it.
+    # Short timeouts and no proxy keep a non-EC2 machine from stalling the
+    # chain.
     #
     # Provenance: paths, the `X-aws-ec2-metadata-token-ttl-seconds` header and
     # response field names pinned from `botocore.utils.InstanceMetadataFetcher`
@@ -26,7 +29,7 @@ module KrikriAwsSsm
       def credentials : Credentials?
         endpoint = URI.parse(@config.imds_endpoint)
         token = session_token(endpoint)
-        return unless token
+        return if token.nil? && @config.imds_v1_disabled?
 
         role = role_name(endpoint, token)
         return unless role
@@ -47,7 +50,7 @@ module KrikriAwsSsm
         token.empty? ? nil : token
       end
 
-      private def role_name(endpoint : URI, token : String) : String?
+      private def role_name(endpoint : URI, token : String?) : String?
         response = perform("GET", endpoint, path(endpoint, ROLE_PATH), token_headers(endpoint, token))
         return unless response.success?
         response.body.each_line do |line|
@@ -57,7 +60,7 @@ module KrikriAwsSsm
         nil
       end
 
-      private def read_credentials(endpoint : URI, token : String, role : String) : Credentials?
+      private def read_credentials(endpoint : URI, token : String?, role : String) : Credentials?
         response = perform("GET", endpoint, path(endpoint, "#{ROLE_PATH}#{role}"),
           token_headers(endpoint, token))
         return unless response.success?
@@ -76,18 +79,26 @@ module KrikriAwsSsm
         nil
       end
 
-      private def token_headers(endpoint : URI, token : String) : HTTP::Headers
-        HTTP::Headers{
-          "Host"       => HTTPTransport.authority(endpoint),
-          TOKEN_HEADER => token,
-        }
+      private def token_headers(endpoint : URI, token : String?) : HTTP::Headers
+        headers = HTTP::Headers{"Host" => HTTPTransport.authority(endpoint)}
+        headers[TOKEN_HEADER] = token if token
+        headers
       end
 
       private def perform(method : String, endpoint : URI, resource : String,
                           headers : HTTP::Headers) : HTTP::Client::Response
-        request = HTTP::Request.new(method, resource, headers)
-        HTTPTransport.perform(request, endpoint, @config.imds_transport_or_default,
-          @config.connect_timeout, @config.read_timeout)
+        attempts = @config.imds_attempts
+        attempt = 0
+        loop do
+          attempt += 1
+          begin
+            request = HTTP::Request.new(method, resource, headers)
+            return HTTPTransport.perform(request, endpoint, @config.imds_transport_or_default,
+              @config.connect_timeout, @config.read_timeout)
+          rescue ex : IO::Error
+            raise ex if attempt >= attempts
+          end
+        end
       end
 
       private def path(endpoint : URI, suffix : String) : String

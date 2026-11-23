@@ -46,6 +46,14 @@ describe KrikriAwsSsm::Encrypter do
     assert_raises(KrikriAwsSsm::ProtocolError) { encrypter.decrypt(ciphertext) }
   end
 
+  it "rejects a payload encrypted under another key" do
+    first = KrikriAwsSsm::Encrypter.new(Bytes.new(64, &.to_u8))
+    second = KrikriAwsSsm::Encrypter.new(Bytes.new(64) { |index| (index + 7).to_u8 })
+    assert_raises(KrikriAwsSsm::ProtocolError) do
+      second.decrypt(first.encrypt("secret".to_slice))
+    end
+  end
+
   it "rejects short ciphertexts and bad key sizes" do
     encrypter = KrikriAwsSsm::Encrypter.new(Bytes.new(64))
     assert_raises(KrikriAwsSsm::ProtocolError) { encrypter.decrypt(Bytes.new(27)) }

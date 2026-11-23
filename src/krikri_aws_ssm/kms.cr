@@ -32,6 +32,12 @@ module KrikriAwsSsm
       def inspect(io : IO) : Nil
         to_s(io)
       end
+
+      # Zero the plaintext key. An `Encrypter` built from it holds views of
+      # the same buffer, so this clears that encrypter's halves too.
+      def wipe : Nil
+        @plaintext.fill(0_u8)
+      end
     end
 
     def initialize(@credentials : Credentials | Proc(Credentials), @region : String,

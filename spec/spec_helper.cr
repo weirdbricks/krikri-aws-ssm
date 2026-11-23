@@ -59,8 +59,8 @@ def receive_with_timeout(channel : Channel(T), timeout : Time::Span = 3.seconds)
 end
 
 def wait_until(timeout : Time::Span = 2.seconds, &) : Bool
-  deadline = Time.monotonic + timeout
-  while Time.monotonic < deadline
+  deadline = Time.instant + timeout
+  while Time.instant < deadline
     return true if yield
     sleep 10.milliseconds
   end

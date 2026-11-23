@@ -56,6 +56,14 @@ module KrikriAwsSsm
       raise ProtocolError.new("encrypted payload failed authentication: #{ex.message}")
     end
 
+    # Zero the two key halves at session close. They are views of the 64-byte
+    # KMS plaintext buffer, so this clears the whole data key in place; the
+    # session keeps no other copy.
+    def wipe : Nil
+      @decryption_key.fill(0_u8)
+      @encryption_key.fill(0_u8)
+    end
+
     private def cipher(mode : Symbol, key : Bytes, nonce : Bytes) : OpenSSL::Cipher
       cipher = OpenSSL::Cipher.new("aes-256-gcm")
       mode == :encrypt ? cipher.encrypt : cipher.decrypt

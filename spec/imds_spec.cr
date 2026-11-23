@@ -95,6 +95,80 @@ describe KrikriAwsSsm::CredentialChain::Imds do
       server.close
     end
   end
+  it "falls back to token-less IMDSv1 GETs when the token PUT is refused" do
+    server = TestHttpServer.new do |request|
+      if request.method == "PUT"
+        TestHttpResponse.new(403, "")
+      elsif request.resource == "/latest/meta-data/iam/security-credentials/"
+        TestHttpResponse.new(200, "test-role\n")
+      else
+        TestHttpResponse.new(200, CredentialSpecHelper.metadata_response)
+      end
+    end
+    begin
+      CredentialSpecHelper.with_temp_dir do |dir|
+        chain = CredentialSpecHelper.chain(
+          {"AWS_EC2_METADATA_DISABLED" => "false"}, dir, imds_endpoint: server.url)
+        credentials = chain.resolve
+        assert_equal "METAKEY", credentials.access_key
+
+        assert_equal "PUT", server.next_request.method
+        list_request = server.next_request
+        assert_equal "/latest/meta-data/iam/security-credentials/", list_request.resource
+        assert_nil list_request.headers["X-aws-ec2-metadata-token"]?
+      end
+    ensure
+      server.close
+    end
+  end
+
+  it "refuses the v1 fallback when AWS_EC2_METADATA_V1_DISABLED is set" do
+    requests = 0
+    server = TestHttpServer.new do |_request|
+      requests += 1
+      TestHttpResponse.new(403, "")
+    end
+    begin
+      CredentialSpecHelper.with_temp_dir do |dir|
+        env = {
+          "AWS_EC2_METADATA_DISABLED"    => "false",
+          "AWS_EC2_METADATA_V1_DISABLED" => "true",
+        }
+        chain = CredentialSpecHelper.chain(env, dir, imds_endpoint: server.url)
+        error = assert_raises(KrikriAwsSsm::CredentialsError) { chain.resolve }
+        assert_equal "Unable to locate credentials", error.message
+        assert_equal 1, requests
+      end
+    ensure
+      server.close
+    end
+  end
+end
+
+describe KrikriAwsSsm::CredentialChain::Config do
+  it "honors the IMDS endpoint, mode, attempts and v1 knobs" do
+    explicit = KrikriAwsSsm::CredentialChain::Config.new(env: {
+      "AWS_EC2_METADATA_SERVICE_ENDPOINT"      => "http://127.0.0.1:1338",
+      "AWS_METADATA_SERVICE_NUM_ATTEMPTS"      => "5",
+      "AWS_EC2_METADATA_V1_DISABLED"           => "TRUE",
+      "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE" => "IPv6",
+    })
+    assert_equal "http://127.0.0.1:1338", explicit.imds_endpoint
+    assert_equal 5, explicit.imds_attempts
+    assert explicit.imds_v1_disabled?
+
+    ipv6 = KrikriAwsSsm::CredentialChain::Config.new(
+      env: {"AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE" => "IPv6"})
+    assert_equal "http://[fd00:ec2::254]", ipv6.imds_endpoint
+
+    default = KrikriAwsSsm::CredentialChain::Config.new(env: {} of String => String)
+    assert_equal KrikriAwsSsm::CredentialChain::Config::DEFAULT_IMDS_ENDPOINT,
+      default.imds_endpoint
+    assert_equal 3, default.imds_attempts
+    refute default.imds_v1_disabled?
+    assert_equal 2.seconds, default.container_timeout
+    assert_equal 3, default.container_attempts
+  end
 end
 
 describe KrikriAwsSsm::CredentialChain::Ecs do
@@ -163,9 +237,77 @@ describe KrikriAwsSsm::CredentialChain::Ecs do
     end
   end
 
+  it "accepts the EKS Pod Identity agent's plain-http default endpoint" do
+    captured : HTTP::Request? = nil
+    transport = ->(request : HTTP::Request, _endpoint : URI) do
+      captured = request
+      HTTP::Client::Response.new(200, CredentialSpecHelper.metadata_response)
+    end
+    config = KrikriAwsSsm::CredentialChain::Config.new(
+      env: {"AWS_CONTAINER_CREDENTIALS_FULL_URI" => "http://169.254.170.23/v1/credentials"},
+      transport: transport)
+    credentials = KrikriAwsSsm::CredentialChain.new(config).resolve
+
+    assert_equal "METAKEY", credentials.access_key
+    assert_equal "/v1/credentials", captured.try(&.resource)
+  end
+
+  it "sends the endpoint's query string with the request" do
+    server = TestHttpServer.new do |_request|
+      TestHttpResponse.new(200, CredentialSpecHelper.metadata_response)
+    end
+    begin
+      CredentialSpecHelper.with_temp_dir do |dir|
+        env = {
+          "AWS_CONTAINER_CREDENTIALS_FULL_URI" => "#{server.url}/full/credentials?role=web",
+        }
+        chain = CredentialSpecHelper.chain(env, dir)
+        chain.resolve
+
+        assert_equal "/full/credentials?role=web", server.next_request.resource
+      end
+    ensure
+      server.close
+    end
+  end
+
+  it "prefers the authorization token file over the env var" do
+    server = TestHttpServer.new do |_request|
+      TestHttpResponse.new(200, CredentialSpecHelper.metadata_response)
+    end
+    begin
+      CredentialSpecHelper.with_temp_dir do |dir|
+        token_file = CredentialSpecHelper.write(File.join(dir, "token"), "file-token\n")
+        env = {
+          "AWS_CONTAINER_CREDENTIALS_FULL_URI"     => "#{server.url}/full/credentials",
+          "AWS_CONTAINER_AUTHORIZATION_TOKEN"      => "env-token",
+          "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE" => token_file,
+        }
+        CredentialSpecHelper.chain(env, dir).resolve
+
+        assert_equal "file-token", server.next_request.headers["Authorization"]
+      end
+    ensure
+      server.close
+    end
+  end
+
+  it "rejects an authorization token containing a line break" do
+    CredentialSpecHelper.with_temp_dir do |dir|
+      token_file = CredentialSpecHelper.write(File.join(dir, "token"), "tok\nen")
+      env = {
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI"     => "http://127.0.0.1:1/full/credentials",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE" => token_file,
+      }
+      chain = CredentialSpecHelper.chain(env, dir)
+      error = assert_raises(KrikriAwsSsm::CredentialsError) { chain.resolve }
+      assert_includes error.message.to_s, "line break"
+    end
+  end
+
   it "rejects an insecure non-loopback full URI unless explicitly allowed" do
     CredentialSpecHelper.with_temp_dir do |dir|
-      env = {"AWS_CONTAINER_CREDENTIALS_FULL_URI" => "http://169.254.170.2/creds"}
+      env = {"AWS_CONTAINER_CREDENTIALS_FULL_URI" => "http://10.0.0.1/creds"}
       chain = CredentialSpecHelper.chain(env, dir, allow_insecure: false)
       error = assert_raises(KrikriAwsSsm::ConfigurationError) { chain.resolve }
       assert_includes error.message.to_s, "must use https"

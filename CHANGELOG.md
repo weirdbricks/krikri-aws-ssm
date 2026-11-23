@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.4.0 (2026-11-22)
+
+Review hardening (no public API removals).
+
+- Redact `inspect` on `SessionInfo`, `Credentials`, `Settings`, `Session` and
+  `Kms::DataKey`; it printed every ivar (session tokens, signed stream URLs,
+  secret keys) where only `to_s` was redacted.
+- Treat a non-object JSON body as a typed `ProtocolError`/`ApiError` instead
+  of letting `JSON::Any#[]?` raise a bare `Exception`; the encryption
+  challenge path now fails the handshake rather than killing the reader fiber.
+- Widen the frame-size check to `Int64`, so a hostile `PayloadLength` raises
+  `ProtocolError` instead of `OverflowError`.
+- Bound the data-channel dial: `connect_timeout` on the TCP connect and
+  `read_timeout` for the TLS/upgrade read, cleared once the channel is up.
+- Sign control-plane and KMS calls with refreshed credentials instead of the
+  snapshot taken at construction; one credential read per dial; serialize
+  `Client#credentials`.
+- Bound the credential cache: one superseded value per profile, one provider
+  call for concurrent refreshes, and unknown credentials returned unchanged
+  instead of resolving another profile's keys.
+- Generation-guard resume: stale frames, sends and closes cannot touch the
+  resumed session; a failed resume re-closes instead of leaving it half open;
+  an explicit `terminate` always calls `TerminateSession`, even after
+  `NetworkLost`.
+- Drive liveness from progress (deliveries and meaningful acknowledgements),
+  close a gap that does not heal within `idle_timeout` with `ProtocolError`,
+  and meter buffered out-of-order frames against `output_buffer_limit`.
+- Synchronize the session state read across fibers; wipe the KMS data key on
+  close; acknowledge frames after processing them, track outbound frames
+  before sending, and replace a buffered retransmit instead of overflowing.
+- Credentials parity: IMDSv1 fallback with `AWS_EC2_METADATA_V1_DISABLED`,
+  IMDS endpoint/mode/attempts knobs, the EKS Pod Identity plain-http
+  allow-list, ECS query strings, file-first authorization tokens with
+  line-break rejection, 2 s/3-attempt container timeouts, SSO token refresh,
+  retries for DNS/TLS/throttling, the China partition, `:reason` error-code
+  normalization, empty env values as unset, and a named partial-credentials
+  error. A hung MFA prompt now times out instead of holding the chain mutex.
+- Docs/toolchain: protocol.md send window and liveness text corrected, README
+  and 1664-plan phase/version drift fixed, `Time.monotonic` migrated to
+  `Time.instant`, `spec/live` added to the `just test` build, and `.crush/`
+  ignored.
+
 ## 0.3.0 (2026-11-22)
 
 - Add `Session#write_raw`, a binary-safe write that skips `write`'s

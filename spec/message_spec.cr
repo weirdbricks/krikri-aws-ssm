@@ -136,6 +136,14 @@ describe KrikriAwsSsm::Message do
     assert_equal "payload length 3221225472 does not match frame size 2", error.message
   end
 
+  it "round-trips the plugin's signed sequence numbers" do
+    # Go declares SequenceNumber as int64; the parser reads it as a wrapping
+    # uint64, so a negative sequence must survive encode/decode.
+    message = KrikriAwsSsm::Message.new(
+      message_type: "input_stream_data", sequence_number: -5_i64)
+    assert_equal(-5_i64, KrikriAwsSsm::Message.decode(message.encode).sequence_number)
+  end
+
   it "rejects a message type longer than 32 bytes" do
     error = assert_raises(KrikriAwsSsm::ProtocolError) do
       KrikriAwsSsm::Message.new(message_type: "x" * 33).encode

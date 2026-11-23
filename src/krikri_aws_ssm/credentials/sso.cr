@@ -26,7 +26,7 @@ module KrikriAwsSsm
       def get_role_credentials(profile_name : String, start_url : String, sso_region : String,
                                account_id : String, role_name : String,
                                session_name : String? = nil) : Credentials
-        token = cached_access_token(profile_name, start_url, session_name)
+        token = cached_access_token(profile_name, start_url, session_name, sso_region)
         endpoint = endpoint_url(sso_region)
         query = URI::Params.encode({"role_name" => role_name, "account_id" => account_id})
         path = HTTPTransport.join_path(endpoint, CREDENTIALS_PATH)
@@ -58,7 +58,7 @@ module KrikriAwsSsm
       end
 
       private def cached_access_token(profile_name : String, start_url : String,
-                                      session_name : String?) : String
+                                      session_name : String?, sso_region : String) : String
         path = token_path(start_url, session_name)
         unless File.file?(path)
           raise CredentialsError.new(
@@ -76,16 +76,58 @@ module KrikriAwsSsm
         end
 
         expiry = parse_expiry(expires_at)
-        if expiry.nil? || Time.utc >= expiry
-          raise CredentialsError.new(TOKEN_ERROR)
+        return access_token if expiry && Time.utc < expiry
+
+        # A modern CLI v2 cache also carries a refresh token; botocore asks
+        # sso-oidc CreateToken for a new access token before failing.
+        if refreshed = refresh_access_token(json, sso_region)
+          return refreshed
         end
-        access_token
+        raise CredentialsError.new(TOKEN_ERROR)
       rescue JSON::ParseException
         raise CredentialsError.new(
           "SSO token cache entry for profile #{profile_name} is invalid JSON. #{TOKEN_ERROR}")
       rescue IO::Error
         raise CredentialsError.new(
           "Unable to read the SSO token cache for profile #{profile_name}. #{TOKEN_ERROR}")
+      end
+
+      # `grantType: refresh_token` against the SSO OIDC endpoint, pinned from
+      # `botocore.utils.SSOTokenFetcher._refresh_access_token` (Apache-2.0).
+      # Returns nil when the cache has no refresh material or the call fails;
+      # the caller then reports the login error.
+      private def refresh_access_token(cache : Hash(String, JSON::Any),
+                                       sso_region : String) : String?
+        refresh_token = cache["refreshToken"]?.try(&.as_s?)
+        client_id = cache["clientId"]?.try(&.as_s?)
+        client_secret = cache["clientSecret"]?.try(&.as_s?)
+        return unless refresh_token && client_id && client_secret
+
+        region = cache["region"]?.try(&.as_s?) || sso_region
+        endpoint = URI.parse("https://oidc.#{region}.amazonaws.com")
+        body = JSON.build do |json|
+          json.object do
+            json.field "clientId", client_id
+            json.field "clientSecret", client_secret
+            json.field "grantType", "refresh_token"
+            json.field "refreshToken", refresh_token
+          end
+        end
+        headers = HTTP::Headers{
+          "Host"         => HTTPTransport.authority(endpoint),
+          "Content-Type" => "application/json",
+        }
+        request = HTTP::Request.new("POST", "/token", headers, body)
+        response = HTTPTransport.perform(request, endpoint,
+          @config.sso_transport_or_default,
+          @config.service_connect_timeout, @config.service_read_timeout)
+        return unless response.success?
+
+        response.body.presence.try do |text|
+          JSON.parse(text).as_h?.try(&.["accessToken"]?).try(&.as_s?)
+        end
+      rescue IO::Error | JSON::ParseException
+        nil
       end
 
       private def parse_expiry(value : String) : Time?

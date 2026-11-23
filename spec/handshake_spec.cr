@@ -44,6 +44,14 @@ describe KrikriAwsSsm::Handshake do
     assert_equal "key-1", request.requested_client_actions[1].action_parameters.try(&.["KMSKeyId"]).try(&.as_s)
   end
 
+  it "parses KMSEncryptionRequest parameters and round-trips them" do
+    request = KrikriAwsSsm::Handshake::KMSEncryptionRequest.from_json(
+      %({"KMSKeyId":"key-1","Challenge":"Y2hhbGxlbmdl"}))
+    assert_equal "key-1", request.kms_key_id
+    assert_equal "Y2hhbGxlbmdl", request.challenge
+    assert_equal %({"KMSKeyId":"key-1","Challenge":"Y2hhbGxlbmdl"}), request.to_json
+  end
+
   it "parses SessionTypeRequest properties" do
     request = KrikriAwsSsm::Handshake::SessionTypeRequest.from_json(
       %({"SessionType":"Standard_Stream","Properties":{"runAsEnabled":true}}))

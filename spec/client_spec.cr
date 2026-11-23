@@ -303,6 +303,70 @@ describe KrikriAwsSsm::Client do
     end
     assert_equal 1, attempts
   end
+
+  it "retries a throttled call and keeps the result" do
+    attempts = 0
+    transport = ->(_request : HTTP::Request, _uri : URI) do
+      attempts += 1
+      if attempts == 1
+        HTTP::Client::Response.new(400,
+          %({"__type":"ThrottlingException","message":"slow down"}))
+      else
+        HTTP::Client::Response.new(200, ClientSpecData::START_RESPONSE)
+      end
+    end
+    settings = KrikriAwsSsm::Settings.new("i-0123456789",
+      endpoint_url: "http://127.0.0.1:1", allow_insecure_endpoint: true,
+      credentials: ClientSpecData::CREDS, retries: 2)
+    json = KrikriAwsSsm::AwsJson.new("ssm", "us-east-1", ClientSpecData::CREDS,
+      endpoint_url: "http://127.0.0.1:1", allow_insecure_endpoint: true,
+      retries: 2, transport: transport)
+    info = KrikriAwsSsm::Client.new(settings, aws_json: json).start_session
+
+    assert_equal 2, attempts
+    assert_equal "s-1", info.session_id
+  end
+
+  it "wraps a malformed endpoint URL as a ConfigurationError" do
+    settings = KrikriAwsSsm::Settings.new("i-0123456789",
+      endpoint_url: "http://foo:bar", credentials: ClientSpecData::CREDS)
+    error = assert_raises(KrikriAwsSsm::ConfigurationError) do
+      KrikriAwsSsm::Client.new(settings).start_session
+    end
+    assert_includes error.message.to_s, "not a valid URL"
+  end
+
+  it "targets the amazonaws.com.cn partition for cn- regions" do
+    captured : URI? = nil
+    transport = ->(_request : HTTP::Request, uri : URI) do
+      captured = uri
+      HTTP::Client::Response.new(200, %({"Sessions":[]}))
+    end
+    json = KrikriAwsSsm::AwsJson.new("ssm", "cn-north-1", ClientSpecData::CREDS,
+      transport: transport)
+    json.call("DescribeSessions", %({"State":"Active"}))
+
+    assert_equal "ssm.cn-north-1.amazonaws.com.cn", captured.try(&.host)
+  end
+
+  it "normalizes the x-amzn-errortype reason suffix" do
+    server = TestHttpServer.new do |_request|
+      TestHttpResponse.new(400, "denied",
+        HTTP::Headers{"x-amzn-errortype" => "AccessDeniedException:http://internal.amazon.com/coral"})
+    end
+    begin
+      settings = KrikriAwsSsm::Settings.new("i-0123456789",
+        endpoint_url: server.url, allow_insecure_endpoint: true,
+        credentials: ClientSpecData::CREDS)
+      error = assert_raises(KrikriAwsSsm::AccessDenied) do
+        KrikriAwsSsm::Client.new(settings).start_session
+      end
+      assert_equal "AccessDeniedException", error.code
+      assert_equal 400, error.status
+    ensure
+      server.close
+    end
+  end
 end
 
 describe KrikriAwsSsm::CredentialChain do

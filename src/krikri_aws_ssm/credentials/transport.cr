@@ -40,8 +40,9 @@ module KrikriAwsSsm
       end
 
       # Validate an endpoint override. Plain HTTP is refused unless the caller
-      # explicitly allowed it or *allow_loopback_http* is set and the host is a
-      # loopback address (the metadata services and local test servers).
+      # explicitly allowed it, or *allow_loopback_http* is set and the host is
+      # a container metadata host (the metadata services and local test
+      # servers).
       def parse_endpoint(url : String, allow_insecure : Bool, service : String,
                          allow_loopback_http : Bool = false) : URI
         uri = URI.parse(url)
@@ -50,12 +51,25 @@ module KrikriAwsSsm
         raise ConfigurationError.new("#{service} endpoint #{url} has no host") unless host
         unless scheme == "https" ||
                (allow_insecure && scheme == "http") ||
-               (allow_loopback_http && scheme == "http" && loopback?(host))
+               (allow_loopback_http && scheme == "http" && allowed_metadata_http?(host))
           raise ConfigurationError.new(
             "#{service} endpoint #{url} must use https " \
             "(http is only allowed for a loopback address or with allow_insecure_endpoint)")
         end
         uri
+      end
+
+      # Hosts botocore accepts over plain HTTP for container credentials: its
+      # loopback set plus the ECS and EKS Pod Identity agent addresses. The
+      # EKS Pod Identity default endpoint is
+      # `http://169.254.170.23/v1/credentials`, so refusing it made that
+      # provider unusable here.
+      ALLOWED_METADATA_HTTP_HOSTS = Set{
+        "169.254.170.2", "169.254.170.23", "fd00:ec2::23", "[fd00:ec2::23]",
+      }
+
+      def allowed_metadata_http?(host : String) : Bool
+        loopback?(host) || ALLOWED_METADATA_HTTP_HOSTS.includes?(host)
       end
 
       def loopback?(host : String) : Bool

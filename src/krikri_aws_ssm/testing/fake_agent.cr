@@ -78,18 +78,26 @@ module KrikriAwsSsm::Testing
 
     # --- frames the client should handle ----------------------------------
 
-    def send_output(bytes : Bytes, payload_type : PayloadType = PayloadType::Output) : Nil
+    def send_output(bytes : Bytes, payload_type : PayloadType = PayloadType::Output,
+                    sequence : Int64? = nil) : Nil
       @outputs_sent.add(1)
       if encrypter = @encrypter
         if [PayloadType::Output.value, PayloadType::StdErr.value, PayloadType::ExitCode.value].includes?(payload_type.value)
           bytes = encrypter.encrypt(bytes)
         end
       end
-      send_stream_message(MessageType::OUTPUT_STREAM_DATA, payload_type.value, bytes)
+      send_stream_message(MessageType::OUTPUT_STREAM_DATA, payload_type.value, bytes, sequence)
     end
 
-    def send_output(text : String, payload_type : PayloadType = PayloadType::Output) : Nil
-      send_output(text.to_slice, payload_type)
+    def send_output(text : String, payload_type : PayloadType = PayloadType::Output,
+                    sequence : Int64? = nil) : Nil
+      send_output(text.to_slice, payload_type, sequence)
+    end
+
+    # The sequence the next naturally sent frame will carry. A spec can send
+    # *next_output_sequence + 1* to leave an inbound gap.
+    def next_output_sequence : Int64
+      @out_mutex.synchronize { @out_sequence }
     end
 
     def send_exit_code(code : Int32) : Nil
@@ -143,7 +151,8 @@ module KrikriAwsSsm::Testing
         process.terminate unless process.terminated?
       end
       @ws.close unless @channel_closed_sent
-    rescue
+    rescue IO::Error
+      # Teardown is best-effort; a dead socket or pty is expected here.
     end
 
     # Hold acknowledgements so a spec can watch the client's send window fill,
@@ -352,11 +361,11 @@ module KrikriAwsSsm::Testing
     end
 
     private def send_stream_message(message_type : String, payload_type : UInt32,
-                                    payload : Bytes) : Nil
+                                    payload : Bytes, sequence_override : Int64? = nil) : Nil
       @send_mutex.synchronize do
         frame = @out_mutex.synchronize do
-          sequence = @out_sequence
-          @out_sequence += 1
+          sequence = sequence_override || @out_sequence
+          @out_sequence += 1 if sequence_override.nil?
           Message.new(
             message_type: message_type,
             payload: payload,
@@ -419,7 +428,8 @@ module KrikriAwsSsm::Testing
       # #stop): closing the socket here raced it and the client lost both the
       # exit status and the close reason.
       stop
-    rescue
+    rescue IO::Error
+      # Best-effort shutdown; the client sees the close through the frame.
     end
   end
 end

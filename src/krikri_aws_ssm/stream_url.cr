@@ -26,10 +26,24 @@ module KrikriAwsSsm
     end
 
     def presigned?(uri : URI | String) : Bool
-      query = uri.is_a?(URI) ? uri.query : URI.parse(uri).query
+      query = uri.is_a?(URI) ? uri.query : parsed_query(uri)
       return false unless query
-      names = query.split('&').map(&.split('=', 2).first)
+      # Query names are percent-decoded before matching, as the reference
+      # does; a malformed escape is left as written rather than raising a
+      # raw URI error out of a boolean predicate.
+      names = query.split('&').map do |pair|
+        name = pair.split('=', 2).first
+        URI.decode_www_form(name)
+      rescue URI::Error
+        name
+      end
       names.any? { |name| PRESIGNED_PARAMS.includes?(name) }
+    end
+
+    private def parsed_query(url : String) : String?
+      URI.parse(url).query
+    rescue URI::Error
+      nil
     end
 
     # Refuse non-TLS URLs unless an explicit test endpoint is configured, and

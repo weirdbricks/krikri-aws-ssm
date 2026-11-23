@@ -26,7 +26,7 @@ module KrikriAwsSsm
     # session.
     RTT_SAMPLE_CAPACITY = 4_096
 
-    record Pending, bytes : Bytes, sequence : Int64, sent_at : Time::Span, attempts : Int32
+    record Pending, bytes : Bytes, sequence : Int64, sent_at : Time::Instant, attempts : Int32
 
     # Diagnostic view of the outbound channel, updated by `Session#stats`.
     # `bytes_sent`/`bytes_acked` count encoded frames (header plus payload)
@@ -73,7 +73,7 @@ module KrikriAwsSsm
     getter rtt_variation : Time::Span
 
     def initialize(@max_attempts : Int32 = DEFAULT_MAX_ATTEMPTS,
-                   @now : Proc(Time::Span) = -> { Time.monotonic })
+                   @now : Proc(Time::Instant) = -> { Time.instant })
       @queue = Deque(Pending).new
       @mutex = Mutex.new
       @srtt = INITIAL_SRTT
@@ -112,6 +112,19 @@ module KrikriAwsSsm
         @messages_sent += 1
         @bytes_sent += bytes.size
         @peak_pending = @queue.size if @queue.size > @peak_pending
+      end
+    end
+
+    # Roll back a frame that was tracked before a send failed, so a sequence
+    # the agent never saw does not sit in the retransmission queue.
+    def untrack(sequence : Int64) : Nil
+      @mutex.synchronize do
+        index = @queue.index { |pending| pending.sequence == sequence }
+        next unless index
+        pending = @queue.delete_at(index)
+        @pending_bytes -= pending.bytes.size
+        @messages_sent -= 1
+        @bytes_sent -= pending.bytes.size
       end
     end
 
@@ -282,21 +295,39 @@ module KrikriAwsSsm
 
     record Acceptance(T), disposition : Disposition, items : Array(T)
 
-    getter expected : Int64 = 0
+    # A buffered item and the bytes it holds, so the buffer can be metered
+    # against the same limit as delivered output.
+    private record Entry(T), item : T, size : Int64
 
-    def initialize(@capacity : Int32 = 10_000)
-      @buffer = {} of Int64 => T
+    getter expected : Int64 = 0
+    # Bytes currently held for out-of-order items.
+    getter buffered_bytes : Int64 = 0
+
+    def initialize(@capacity : Int32 = 10_000, @max_bytes : Int64 = Int64::MAX)
+      @buffer = {} of Int64 => Entry(T)
     end
 
-    def accept(sequence : Int64, item : T) : Acceptance(T)
+    def accept(sequence : Int64, item : T, size : Int64 = 0) : Acceptance(T)
       if sequence < @expected
         Acceptance(T).new(Disposition::Duplicate, [] of T)
       elsif sequence == @expected
         Acceptance(T).new(Disposition::Delivered, deliver(sequence, item))
-      elsif @buffer.size >= @capacity
+      elsif existing = @buffer[sequence]?
+        # A retransmit of a frame already buffered replaces it; classifying
+        # it as Overflow dropped a frame the agent is still waiting on.
+        added = size - existing.size
+        if @buffered_bytes + added > @max_bytes
+          Acceptance(T).new(Disposition::Overflow, [] of T)
+        else
+          @buffered_bytes += added
+          @buffer[sequence] = Entry(T).new(item, size)
+          Acceptance(T).new(Disposition::Buffered, [] of T)
+        end
+      elsif @buffer.size >= @capacity || @buffered_bytes + size > @max_bytes
         Acceptance(T).new(Disposition::Overflow, [] of T)
       else
-        @buffer[sequence] = item
+        @buffer[sequence] = Entry(T).new(item, size)
+        @buffered_bytes += size
         Acceptance(T).new(Disposition::Buffered, [] of T)
       end
     end
@@ -308,8 +339,9 @@ module KrikriAwsSsm
     private def deliver(sequence : Int64, item : T) : Array(T)
       items = [item]
       @expected = sequence + 1
-      while buffered = @buffer.delete(@expected)
-        items << buffered
+      while entry = @buffer.delete(@expected)
+        items << entry.item
+        @buffered_bytes -= entry.size
         @expected += 1
       end
       items

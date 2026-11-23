@@ -29,7 +29,11 @@ module KrikriAwsSsm
     getter providers : Array(Provider)
 
     @cache : Hash(String, Credentials)
-    @profile_by_credentials : Hash(Credentials, String)
+    # The credential value each profile's cache entry replaced, so a caller
+    # still holding it can be mapped back to its profile. Bounded to one
+    # superseded value per profile: keying a map by the value itself leaked a
+    # secret-bearing key on every refresh of an expiring profile.
+    @previous : Hash(String, Credentials)
     @last_profile : String?
     @mutex : Mutex
 
@@ -38,14 +42,14 @@ module KrikriAwsSsm
       @config = Config.new
       @providers = providers
       @cache = {} of String => Credentials
-      @profile_by_credentials = {} of Credentials => String
+      @previous = {} of String => Credentials
       @last_profile = nil
       @mutex = Mutex.new
     end
 
     def initialize(@config : Config = Config.new)
       @cache = {} of String => Credentials
-      @profile_by_credentials = {} of Credentials => String
+      @previous = {} of String => Credentials
       @last_profile = nil
       @mutex = Mutex.new
       @providers = [] of Provider
@@ -69,29 +73,51 @@ module KrikriAwsSsm
       name = effective_profile(profile)
       @mutex.synchronize do
         if cached = @cache[name]?
-          @profile_by_credentials[cached] = name
+          @previous.delete(name)
           return cached unless cached.refresh_needed?
         end
         credentials = resolve_uncached(name)
         @last_profile = name
         @cache[name] = credentials
-        @profile_by_credentials[credentials] = name
         credentials
       end
     end
 
     # Re-resolve the profile that produced *credentials* when they are inside
-    # their refresh window; otherwise return them unchanged.
+    # their refresh window; otherwise return them unchanged. Credentials the
+    # chain never issued are returned unchanged: re-resolving some other
+    # profile would hand the caller another profile's keys.
     def refresh(credentials : Credentials) : Credentials
       return credentials unless credentials.refresh_needed?
       @mutex.synchronize do
-        name = @profile_by_credentials[credentials]? || @last_profile || effective_profile(nil)
+        return credentials unless name = profile_for(credentials)
+        # Another fiber may have refreshed this profile while this caller
+        # waited for the mutex; reuse that result instead of a second
+        # AssumeRole round-trip (and a second MFA prompt).
+        if cached = @cache[name]?
+          return cached unless cached.refresh_needed?
+        end
         fresh = resolve_uncached(name)
         @last_profile = name
         @cache[name] = fresh
-        @profile_by_credentials[fresh] = name
+        @previous[name] = credentials unless credentials == fresh
         fresh
       end
+    end
+
+    # A credentials value is all the public API gives us, so an identical
+    # value from two profiles is ambiguous; prefer the last resolved profile.
+    private def profile_for(credentials : Credentials) : String?
+      if name = @last_profile
+        return name if @cache[name]? == credentials || @previous[name]? == credentials
+      end
+      @cache.each do |cached_name, cached|
+        return cached_name if cached == credentials
+      end
+      @previous.each do |previous_name, previous|
+        return previous_name if previous == credentials
+      end
+      nil
     end
 
     # `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN`),
@@ -101,10 +127,12 @@ module KrikriAwsSsm
     end
 
     def self.static_credentials(env : Hash(String, String)) : Credentials?
-      access_key = env["AWS_ACCESS_KEY_ID"]? || env["AWS_ACCESS_KEY"]?
-      secret_key = env["AWS_SECRET_ACCESS_KEY"]? || env["AWS_SECRET_KEY"]?
+      # Botocore treats an empty env value as unset; without `presence` a
+      # blank AWS_ACCESS_KEY_ID also shadowed the legacy spellings.
+      access_key = env["AWS_ACCESS_KEY_ID"]?.presence || env["AWS_ACCESS_KEY"]?.presence
+      secret_key = env["AWS_SECRET_ACCESS_KEY"]?.presence || env["AWS_SECRET_KEY"]?.presence
       return unless access_key && secret_key
-      Credentials.new(access_key, secret_key, env["AWS_SESSION_TOKEN"]?)
+      Credentials.new(access_key, secret_key, env["AWS_SESSION_TOKEN"]?.presence)
     end
 
     private def resolve_uncached(name : String) : Credentials
@@ -168,7 +196,7 @@ module KrikriAwsSsm
       end
       visited = visited + [name]
 
-      static = static_profile_credentials?(profile)
+      static = static_profile_credentials?(name, profile)
       role_arn = profile["role_arn"]?
       if top_level || (!static && role_arn)
         if role_arn
@@ -226,7 +254,7 @@ module KrikriAwsSsm
 
       if visited.includes?(source_name)
         # A profile may reference itself only to combine static credentials.
-        if source_name == parent_name && static_profile_credentials?(profile)
+        if source_name == parent_name && static_profile_credentials?(source_name, profile)
           return static_profile_credentials(profile)
         end
         raise cycle_error(source_name, visited)
@@ -301,7 +329,7 @@ module KrikriAwsSsm
           output.puts "Warning: MFA code input may be echoed." unless hidden
           output.print "Enter MFA code for #{serial}: "
           output.flush
-          code = input.gets
+          code = read_mfa_code(input, serial)
         ensure
           terminal_echo(enabled: true) if hidden
         end
@@ -311,6 +339,33 @@ module KrikriAwsSsm
           raise CredentialsError.new("No MFA code was entered for #{serial}")
         end
         code
+      end
+    end
+
+    # A prompt that never returns holds the chain mutex and the class-wide
+    # prompt mutex, wedging every credential resolution in the process, so
+    # the read is bounded. A real terminal gets a read timeout; any other
+    # injected IO is raced against the deadline.
+    private def read_mfa_code(input : IO, serial : String) : String?
+      if input.responds_to?(:read_timeout=) && input.responds_to?(:read_timeout)
+        previous = input.read_timeout
+        input.read_timeout = @config.mfa_timeout
+        begin
+          input.gets
+        rescue IO::TimeoutError
+          raise CredentialsError.new("Timed out waiting for the MFA code for #{serial}")
+        ensure
+          input.read_timeout = previous
+        end
+      else
+        channel = Channel(String?).new(1)
+        spawn { channel.send(input.gets) }
+        select
+        when code = channel.receive
+          code
+        when timeout(@config.mfa_timeout)
+          raise CredentialsError.new("Timed out waiting for the MFA code for #{serial}")
+        end
       end
     end
 
@@ -401,8 +456,19 @@ module KrikriAwsSsm
         "credential_process for profile \"#{name}\" returned an invalid Expiration: #{ex.message}")
     end
 
-    private def static_profile_credentials?(profile : Hash(String, String)) : Bool
-      !profile["aws_access_key_id"]?.nil? && !profile["aws_secret_access_key"]?.nil?
+    # A profile with only one of the two static keys is a configuration
+    # error botocore names (`PartialCredentialsError`); falling through made
+    # it look like "Unable to locate credentials".
+    private def static_profile_credentials?(name : String,
+                                            profile : Hash(String, String)) : Bool
+      access_key = profile["aws_access_key_id"]?
+      secret_key = profile["aws_secret_access_key"]?
+      if access_key.nil? != secret_key.nil?
+        missing = access_key ? "aws_secret_access_key" : "aws_access_key_id"
+        raise CredentialsError.new(
+          "Partial credentials found in profile \"#{name}\", missing: #{missing}")
+      end
+      !access_key.nil?
     end
 
     private def static_profile_credentials(profile : Hash(String, String)) : Credentials

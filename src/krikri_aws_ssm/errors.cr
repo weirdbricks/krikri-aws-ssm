@@ -58,10 +58,13 @@ module KrikriAwsSsm
 
     # Map an AWS error code (with or without the `com.amazonaws.ssm#` prefix)
     # to a typed error. Unknown codes stay an `ApiError` so the caller still
-    # sees the service's own message text.
+    # sees the service's own message text. Botocore strips a `:reason` suffix
+    # as well as the namespace: `x-amzn-errortype` values like
+    # `AccessDeniedException:http://internal.amazon.com/...` are common.
     def self.from_code(code : String, message : String, status : Int32? = nil,
                        request_id : String? = nil) : ApiError
-      short = code.includes?('#') ? code.split('#').last : code
+      short = code.split(':', 2).first
+      short = short.split('#').last
       case short
       when "AccessDeniedException", "AccessDenied"
         AccessDenied.new(short, message, status, request_id)

@@ -36,14 +36,37 @@ module KrikriAwsSsm
         if token = authorization_token
           headers["Authorization"] = token
         end
-        path = endpoint.path.empty? ? "/" : endpoint.path
-        request = HTTP::Request.new("GET", path, headers)
-        response = HTTPTransport.perform(request, endpoint,
-          @config.ecs_transport_or_default, @config.connect_timeout, @config.read_timeout)
+        request = HTTP::Request.new("GET", request_target(endpoint), headers)
+        response = perform(request, endpoint)
         return unless response.success?
         parse_credentials(response.body)
       rescue IO::Error
         nil
+      end
+
+      # The full URL is sent, including its query string: botocore forwards
+      # the endpoint as configured and some container endpoints need `?…`.
+      private def request_target(endpoint : URI) : String
+        path = endpoint.path.empty? ? "/" : endpoint.path
+        endpoint.query ? "#{path}?#{endpoint.query}" : path
+      end
+
+      # Botocore gives the container endpoint 2 s and three attempts; the
+      # 250 ms IMDS budget failed a remote https FULL_URI on a slow link.
+      private def perform(request : HTTP::Request,
+                          endpoint : URI) : HTTP::Client::Response
+        attempts = @config.container_attempts
+        attempt = 0
+        loop do
+          attempt += 1
+          begin
+            return HTTPTransport.perform(request, endpoint, @config.ecs_transport_or_default,
+              @config.container_timeout, @config.container_timeout)
+          rescue ex : IO::Error
+            raise ex if attempt >= attempts
+            sleep 1.second
+          end
+        end
       end
 
       private def endpoint_url : URI?
@@ -58,13 +81,28 @@ module KrikriAwsSsm
         end
       end
 
+      # Botocore checks the file first, then the env var, strips the token,
+      # and rejects one containing a line break (a multi-line token would
+      # split the header).
       private def authorization_token : String?
         env = @config.env
-        return env[AUTH_TOKEN_ENV]?.presence if env[AUTH_TOKEN_ENV]?
-        return unless path = env[AUTH_TOKEN_FILE_ENV]?
-        File.read(path).strip.presence
-      rescue IO::Error
-        nil
+        token = if path = env[AUTH_TOKEN_FILE_ENV]?
+                  begin
+                    File.read(path)
+                  rescue IO::Error
+                    nil
+                  end
+                else
+                  env[AUTH_TOKEN_ENV]?
+                end
+        return unless token
+        token = token.strip
+        return if token.empty?
+        if token.includes?('\r') || token.includes?('\n')
+          raise CredentialsError.new(
+            "container authorization token is invalid: it contains a line break")
+        end
+        token
       end
 
       private def parse_credentials(body : String) : Credentials?

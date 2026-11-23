@@ -2,6 +2,6 @@ require "./spec_helper"
 
 describe KrikriAwsSsm do
   it "exposes the shard version" do
-    assert_equal "0.3.0", KrikriAwsSsm::VERSION
+    assert_equal "0.4.0", KrikriAwsSsm::VERSION
   end
 end

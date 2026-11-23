@@ -23,6 +23,15 @@ same session; `TerminateSession` ends it.
   `X-Amz-Security-Token` when a session token exists.
 - If the URL is presigned (`X-Amz-Signature`, `X-Amz-Credential`, ...), dial it
   unsigned, like the reference `IsPresignedURL` branch.
+- The dial bounds connect (`connect_timeout`) and the TLS/upgrade read
+  (`read_timeout`); the established channel is long-lived and is paced by the
+  ping/idle loops instead.
+- Trust assumption: the peer is the AWS service and its agent over TLS, so the
+  websocket layer does not cap a single message's size before the frame parser
+  runs (Crystal's `HTTP::WebSocket::Protocol` allocates from the declared
+  length). A compromised agent could therefore force a large allocation before
+  the SSM frame parser sees the message; that parser still rejects a payload
+  length that disagrees with the frame.
 - First frame is a websocket TEXT message:
 
 ```json
@@ -112,18 +121,25 @@ send window above and never by blocking this reader.
 - Ack header: `SequenceNumber = 0`, `Flags = SYN | FIN`; the acknowledged
   sequence lives in the JSON payload:
   `{"AcknowledgedMessageType":..., "AcknowledgedMessageId":..., "AcknowledgedMessageSequenceNumber":..., "IsSequentialMessage":true}`.
-- Inbound: `seq == expected` deliver+ack; `seq > expected` buffer+ack;
-  `seq < expected` drop without acking.
+- Inbound: `seq == expected` processes the frame then acks it; `seq >
+  expected` buffers and acks it; `seq < expected` drops it without acking.
+  Buffered frames are metered against `output_buffer_limit`, and a gap that
+  does not heal within `idle_timeout` closes with `ProtocolError` instead of
+  waiting for traffic to stop.
 - Chunking: 1024-byte input payloads by default (config), configurable.
-- Liveness: ping every 30s, idle deadline on any inbound frame (120s default).
+- Liveness: ping every 30s; the idle deadline (120s default) runs on
+  *progress* - a delivered frame or an acknowledgement of one of our
+  messages - not on raw inbound bytes, so a peer that keeps retransmitting
+  buffered or duplicate frames cannot mask a wedged sequencer.
 - Timers: retransmit scan 100ms and initial RTO 200ms (`ResendSleepInterval`,
   `DefaultTransmissionTimeout`), give up after 3000 attempts
   (`ResendMaxAttempt`). Jacobson/Karels uses the plugin's 1s cap
   (`MaxTransmissionTimeout`); the 50ms floor is the bridge's, not the
   plugin's (the plugin floors only at `ClockGranularity`, 10ms).
-- Send window: a writer waits for acknowledgements once 10,000 messages are
-  unacknowledged (`OutgoingMessageBufferCapacity`). The reference plugin
-  instead drops the oldest unacknowledged entry
+- Send window: a writer waits for acknowledgements once 64 KiB of encoded
+  frames are unacknowledged (`Settings#send_window_bytes`; measured, see the
+  Throughput section). The reference plugin instead bounds by
+  `OutgoingMessageBufferCapacity` and drops the oldest unacknowledged entry
   (`AddDataToOutgoingMessageBuffer` in `src/datachannel/streaming.go`), which
   abandons a sequence the agent is still waiting for and can stall the stream;
   `aws-ssm-bridge` documents the same divergence. A stream with no

@@ -15,7 +15,7 @@ test-serial:
 
 build-spec:
     mkdir -p .crystal-build-cache
-    crystal build spec/spec_helper.cr spec/*_spec.cr -o {{abs_spec_bin}}
+    crystal build spec/spec_helper.cr spec/*_spec.cr spec/live/*_spec.cr -o {{abs_spec_bin}}
 
 # Formatting and lint.
 format:

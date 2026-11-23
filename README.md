@@ -6,12 +6,13 @@ data-channel protocol itself, so the controller needs **no AWS CLI** and **no
 `session-manager-plugin`** - only the SSM agent on the target and the usual AWS
 permissions.
 
-Status: phases 1-8 complete (wire protocol and session core, fake harness,
-control plane, KMS encryption, credential chain, live validation, and the
-krikri SSM transport). The remaining krikri wiring and its test matrix
-(phases 9-10) live in krikri-playbook, where `synchronize:` push and pull now
-run through the session as well (live-verified, issue #1694). See
-`docs/protocol.md` for the wire format and the design notes it is built from.
+Status: phases 1-11 complete (wire protocol and session core, fake harness,
+control plane, KMS encryption, credential chain, live validation, the krikri
+SSM transport, the krikri wiring and its test matrix, and the docs). The
+remaining release-gate work is a live krikri-role-tester round and the 40 MB
+transfer timing. `synchronize:` push and pull run through the session as well
+(live-verified, issue #1694). See `docs/protocol.md` for the wire format and
+the design notes it is built from.
 
 ## What it does
 

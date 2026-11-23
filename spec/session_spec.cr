@@ -70,12 +70,12 @@ describe KrikriAwsSsm::Session do
       credentials: SessionSpecData::CREDS, connect_timeout: 2.seconds,
       read_timeout: 200.milliseconds)
     begin
-      started = Time.monotonic
+      started = Time.instant
       error = assert_raises(KrikriAwsSsm::HandshakeFailed) do
         KrikriAwsSsm::Session.open(settings)
       end
       assert_includes error.message.to_s, "failed to open data channel"
-      elapsed = Time.monotonic - started
+      elapsed = Time.instant - started
       assert elapsed >= 200.milliseconds
       assert elapsed < 3.seconds
     ensure
@@ -280,6 +280,35 @@ describe KrikriAwsSsm::Session do
     end
   end
 
+  it "passes a multi-chunk binary write_raw stream untouched" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    settings = KrikriAwsSsm::Settings.new("i-0123456789",
+      endpoint_url: gateway.url, allow_insecure_endpoint: true,
+      credentials: SessionSpecData::CREDS, connect_timeout: 5.seconds,
+      idle_timeout: 5.seconds, chunk_size: 3)
+    begin
+      session = KrikriAwsSsm::Session.open(settings)
+      begin
+        agent = receive_with_timeout(gateway.agents)
+        receive_with_timeout(agent.handshake_responses)
+
+        payload = Bytes[0_u8, 10_u8, 13_u8, 10_u8, 255_u8, 65_u8, 0_u8, 10_u8]
+        session.write_raw(payload)
+
+        received = Bytes.empty
+        (payload.size // 3 + 1).times do
+          received += receive_with_timeout(agent.received_input)
+        end
+        assert_equal payload, received
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
   it "delivers the shell's exit code and AgentClosed when the shell exits" do
     gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
     begin
@@ -409,6 +438,32 @@ describe KrikriAwsSsm::Session do
     end
   end
 
+  it "closes with ProtocolError when an inbound gap does not heal" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    begin
+      session = KrikriAwsSsm::Session.open(
+        SessionSpecData.settings(gateway, idle_timeout: 200.milliseconds))
+      begin
+        agent = receive_with_timeout(gateway.agents)
+        receive_with_timeout(agent.handshake_responses)
+
+        # Skip the next sequence: the frame after it is buffered, acked and
+        # can never be delivered, so the session must not look alive.
+        agent.send_output("ahead", sequence: agent.next_output_sequence + 1)
+
+        assert wait_until(3.seconds) { session.closed? }
+        assert_equal KrikriAwsSsm::CloseReason::ProtocolError, session.close_reason
+        assert_includes session.error.to_s, "inbound sequence gap"
+        assert_nil read_with_timeout(session)
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
   it "terminates on the control plane and closes the channel idempotently" do
     gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
     gateway.agent_options = SessionSpecData.quiet_agent_options
@@ -452,9 +507,9 @@ describe KrikriAwsSsm::Session do
         session.write("echo krikri-ssm-pty\n")
 
         output = ""
-        deadline = Time.monotonic + 5.seconds
-        while Time.monotonic < deadline
-          chunk = read_with_timeout(session, deadline - Time.monotonic).try(&.bytes)
+        deadline = Time.instant + 5.seconds
+        while Time.instant < deadline
+          chunk = read_with_timeout(session, deadline - Time.instant).try(&.bytes)
           break unless chunk
           output += String.new(chunk)
           break if output.includes?("krikri-ssm-pty")
@@ -480,9 +535,9 @@ describe KrikriAwsSsm::Session do
         session.write("printf '%s\\n' \"$KRIKRI_SSM_TEST_ENV\"\n")
 
         output = ""
-        deadline = Time.monotonic + 5.seconds
-        while Time.monotonic < deadline
-          chunk = read_with_timeout(session, deadline - Time.monotonic).try(&.bytes)
+        deadline = Time.instant + 5.seconds
+        while Time.instant < deadline
+          chunk = read_with_timeout(session, deadline - Time.instant).try(&.bytes)
           break unless chunk
           output += String.new(chunk)
           break if output.includes?("from-harness")
@@ -515,9 +570,9 @@ describe KrikriAwsSsm::Session do
         end
 
         output = ""
-        deadline = Time.monotonic + 30.seconds
-        while Time.monotonic < deadline
-          chunk = read_with_timeout(session, deadline - Time.monotonic).try(&.bytes)
+        deadline = Time.instant + 30.seconds
+        while Time.instant < deadline
+          chunk = read_with_timeout(session, deadline - Time.instant).try(&.bytes)
           break unless chunk
           output += String.new(chunk)
           break if output.includes?("STREAM-DONE")
@@ -767,6 +822,52 @@ describe KrikriAwsSsm::Session do
         open_message = receive_with_timeout(second_agent.open_messages)
         assert_equal "fake-token-2", open_message["TokenValue"].as_s
         refute session.closed?
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+  it "re-closes the session when resume cannot reopen the channel" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    begin
+      session = KrikriAwsSsm::Session.open(SessionSpecData.settings(gateway))
+      begin
+        first_agent = receive_with_timeout(gateway.agents)
+        receive_with_timeout(first_agent.handshake_responses)
+        first_agent.abrupt_close
+        assert wait_until(2.seconds) { session.closed? }
+
+        gateway.stream_url_override = "ws://127.0.0.1:1/data-channel/s-fake-1"
+        error = assert_raises(KrikriAwsSsm::HandshakeFailed) { session.resume }
+        assert_includes error.message.to_s, "failed to open data channel"
+        assert session.closed?
+        refute_nil session.error
+      ensure
+        session.terminate
+      end
+    ensure
+      gateway.close
+    end
+  end
+
+  it "terminates on the control plane after the channel was lost" do
+    gateway = KrikriAwsSsm::Testing::FakeGateway.new(SessionSpecData::CREDS)
+    gateway.agent_options = SessionSpecData.quiet_agent_options
+    begin
+      session = KrikriAwsSsm::Session.open(SessionSpecData.settings(gateway))
+      begin
+        agent = receive_with_timeout(gateway.agents)
+        receive_with_timeout(agent.handshake_responses)
+        agent.abrupt_close
+        assert wait_until(2.seconds) { session.closed? }
+        assert_equal KrikriAwsSsm::CloseReason::NetworkLost, session.close_reason
+
+        session.terminate
+        assert_equal "s-fake-1", receive_with_timeout(gateway.terminated_sessions)
+        assert_equal KrikriAwsSsm::CloseReason::NetworkLost, session.close_reason
       ensure
         session.terminate
       end
