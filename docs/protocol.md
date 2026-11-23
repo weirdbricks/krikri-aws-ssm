@@ -1,7 +1,7 @@
 # SSM Session Manager wire protocol (working notes)
 
-Status: working spec transcribed from the reference implementations. Phases 1-5
-pin every constant below with tests taken from the sources - nothing here may
+Status: working spec transcribed from the reference implementations. Every
+constant below is pinned by specs taken from the sources - nothing here may
 be "confirmed" against this shard's own output. AWS publishes the control
 plane only; the data channel is defined by `aws/session-manager-plugin`
 (Apache-2.0) and documented by observation in `hupe1980/aws-ssm-bridge` (MIT).
@@ -253,7 +253,7 @@ asserts the open message carries the new token.
 
 ## Pin list status
 
-Pinned by phase 1-4 specs:
+Pinned by the protocol and session specs:
 
 - Header constants, offsets, `MessageType` space padding and digest exemptions
   (`clientmessage.go` / `messageparser.go`).
@@ -269,7 +269,7 @@ Pinned by phase 1-4 specs:
   `HandshakeTimeToComplete`.
 - `ResumeSession` state replay (decision above).
 
-Pinned by phase 5 specs:
+Pinned by the KMS and encryption specs:
 
 - KMS `GenerateDataKey` request shape (`NumberOfBytes: 64`, encryption context
   `aws:ssm:SessionId` / `aws:ssm:TargetId`) and the exact action result JSON
