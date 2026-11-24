@@ -1,6 +1,6 @@
 require "krikri-aws-signer"
+require "krikri-xml"
 require "uri"
-require "xml"
 require "../errors"
 require "./config"
 require "./types"
@@ -117,7 +117,7 @@ module KrikriAwsSsm
       end
 
       private def sts_error(action : String, response : HTTP::Client::Response) : String
-        document = XML.parse(response.body) rescue nil
+        document = KXML.parse(response.body) rescue nil
         code = document.try { |doc| find_text(doc, "Code") } || "HTTP #{response.status_code}"
         message = document.try { |doc| find_text(doc, "Message") }
         return "STS #{action} failed: #{code}" unless message
@@ -125,8 +125,8 @@ module KrikriAwsSsm
       end
 
       private def parse_credentials(xml : String, action : String) : Credentials
-        document = XML.parse(xml)
-        root = document.first_element_child
+        document = KXML.parse(xml)
+        root = document.root
         raise CredentialsError.new("STS #{action} response was empty") unless root
         result = find_node(root, "#{action}Result") || root
         credentials_node = find_node(result, "Credentials")
@@ -143,7 +143,7 @@ module KrikriAwsSsm
         end
 
         Credentials.new(access_key, secret_key, session_token, parse_time(expiration))
-      rescue ex : XML::Error
+      rescue ex : KXML::Error
         raise CredentialsError.new("STS #{action} response was not valid XML: #{ex.message}")
       end
 
@@ -153,19 +153,21 @@ module KrikriAwsSsm
         raise CredentialsError.new("STS response had an invalid expiration: #{ex.message}")
       end
 
-      private def find_node(node : XML::Node, name : String) : XML::Node?
-        return node if node.element? && node.name == name
-        node.children.each do |child|
-          next unless child.element?
+      private def find_node(node : KXML::Element, name : String) : KXML::Element?
+        return node if node.name == name
+        node.elements.each do |child|
           found = find_node(child, name)
           return found if found
         end
         nil
       end
 
-      private def find_text(node : XML::Node, name : String) : String?
-        child = find_node(node, name)
-        child.try(&.content.strip)
+      private def find_text(node : KXML::Element, name : String) : String?
+        find_node(node, name).try(&.text_content.strip)
+      end
+
+      private def find_text(document : KXML::Document, name : String) : String?
+        document.root.try { |root| find_text(root, name) }
       end
     end
   end

@@ -8,6 +8,10 @@ shards:
     git: https://github.com/weirdbricks/krikri-aws-signer.git
     version: 1.0.0+git.commit.82fd59dc9d1a4fb168f95b2996ac036e663e7e21
 
+  krikri-xml:
+    git: https://github.com/weirdbricks/krikri-xml.git
+    version: 1.0.0+git.commit.7805c124d375c8317d0d2d9b6a35cfa686c9429e
+
   minitest:
     git: https://github.com/weirdbricks/minitest.cr.git
     version: 1.7.0+git.commit.180d963facecb8f5864977caceb3314e4d6ad8cb

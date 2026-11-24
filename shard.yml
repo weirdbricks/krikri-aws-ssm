@@ -1,5 +1,5 @@
 name: krikri-aws-ssm
-version: 1.0.1
+version: 1.0.2
 
 repository: weirdbricks/krikri-aws-ssm
 homepage: https://github.com/weirdbricks/krikri-aws-ssm
@@ -20,6 +20,9 @@ license: MIT
 dependencies:
   krikri-aws-signer:
     github: weirdbricks/krikri-aws-signer
+    tag: v1.0.0
+  krikri-xml:
+    github: weirdbricks/krikri-xml
     tag: v1.0.0
 
 development_dependencies:

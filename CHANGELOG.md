@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.2 (2026-11-23)
+
+- Parse STS Query-protocol responses with `krikri-xml` instead of Crystal's
+  stdlib `XML`, so this shard, and every program that requires it, no longer
+  links `libxml2`. A stock Ubuntu image has no `libxml2.so.2`, and a plugin
+  binary carrying the dependency died in the dynamic loader before `main()`
+  (krikri issue #1726).
+
 ## 1.0.1 (2026-11-22)
 
 - Depend on `krikri-aws-signer` v1.0.0 instead of v0.3.0, so consumers get the
